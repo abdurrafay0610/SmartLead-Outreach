@@ -531,7 +531,7 @@ Operational best practice for compliance when using the API:
 | Quickstart citeturn17search6turn9search1 | Official developer docs | End-to-end workflow examples (campaign creation, adding email account, adding leads, sequences). Also contains a start-campaign example that conflicts with API reference (PATCH/ACTIVE). |
 | Create Campaign citeturn18view0 | Official API reference | `POST /campaigns/create`, required `name`, example response, DRAFTED creation note. |
 | Update Campaign Status citeturn19view2turn19view0 | Official API reference | `POST /campaigns/{id}/status` and the critical note: use `START`, not `ACTIVE`, to activate. |
-| Update Campaign Schedule citeturn20view0 | Official API reference | Required `schedule` object fields: timezone/days/start/end (+ optional min time). |
+| Update Campaign Schedule citeturn20view0 | Official API reference | Required fields sent flat in body: timezone/days/start/end (+ optional min time). |
 | Update Campaign Sequences citeturn25view3turn9search5 | Official API reference | Sequence object schema (`seq_number`, `email_body`, delay); notes about creating/updating sequences. |
 | Add Leads to Campaign citeturn25view2turn17search6turn5search8 | Official API reference + guides | `lead_list` schema, max 400 leads per call; examples show `custom_fields` for personalization. |
 | Get Campaign Leads (filters) citeturn11search11turn11search10 | Official API reference | Pagination and filtering including email engagement states (opened/clicked/replied/bounced/unsubscribed). |

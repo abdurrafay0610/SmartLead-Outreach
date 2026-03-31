@@ -128,10 +128,11 @@ class CampaignService:
                 await sl.update_campaign_schedule(
                     campaign_id=delivery.provider_campaign_id,
                     timezone=schedule.timezone,
-                    days=schedule.days,
+                    days_of_the_week=schedule.days_of_the_week,
                     start_hour=schedule.start_hour,
                     end_hour=schedule.end_hour,
                     min_time_btw_emails=schedule.min_time_btw_emails,
+                    max_leads_per_day=schedule.max_leads_per_day,
                 )
                 result["schedule_synced"] = True
                 logger.info("Schedule synced for campaign %s", campaign_id)

@@ -70,6 +70,16 @@ cp .env.example .env
 
 ### 4. Create the database
 ```bash
+docker run -d \
+  --name outreach-postgres \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=outreach \
+  -p 5432:5432 \
+  postgres:16
+```
+
+```bash
 createdb outreach
 ```
 

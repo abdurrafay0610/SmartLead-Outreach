@@ -238,30 +238,29 @@ class SmartleadClient:
         return result
 
     async def update_campaign_schedule(
-        self,
-        campaign_id: str | int,
-        timezone: str,
-        days: list[int],
-        start_hour: str,
-        end_hour: str,
-        min_time_btw_emails: int | None = None,
+            self,
+            campaign_id: str | int,
+            timezone: str,
+            days_of_the_week: list[int],
+            start_hour: str,
+            end_hour: str,
+            min_time_btw_emails: int,
+            max_leads_per_day: int | None = None,
     ) -> dict[str, Any]:
-        """
-        POST /campaigns/{id}/schedule
-        """
-        schedule = {
+        payload = {
             "timezone": timezone,
-            "days": days,
+            "days_of_the_week": days_of_the_week,
             "start_hour": start_hour,
             "end_hour": end_hour,
+            "min_time_btw_emails": min_time_btw_emails,
         }
-        if min_time_btw_emails is not None:
-            schedule["min_time_btw_emails"] = min_time_btw_emails
+        if max_leads_per_day is not None:
+            payload["max_leads_per_day"] = max_leads_per_day
 
         return await self._request(
             "POST",
             f"/campaigns/{campaign_id}/schedule",
-            json_body=schedule,
+            json_body=payload,
         )
 
     async def update_campaign_settings(

@@ -16,11 +16,20 @@ class CampaignCreateRequest(BaseModel):
 
 class ScheduleConfig(BaseModel):
     timezone: str = Field(..., examples=["America/New_York"])
-    days: list[int] = Field(..., examples=[[1, 2, 3, 4, 5]], description="1=Mon, 7=Sun")
+    days_of_the_week: list[int] = Field(
+        ...,
+        examples=[[1, 2, 3, 4, 5]],
+        description="0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat"
+    )
     start_hour: str = Field(..., examples=["09:00"])
     end_hour: str = Field(..., examples=["17:00"])
-    min_time_btw_emails: Optional[int] = Field(
-        None, description="Minimum seconds between emails"
+    min_time_btw_emails: int = Field(
+        ...,
+        description="Minutes between consecutive emails"
+    )
+    max_leads_per_day: Optional[int] = Field(
+        None,
+        description="Maximum new leads to email per day"
     )
 
 
