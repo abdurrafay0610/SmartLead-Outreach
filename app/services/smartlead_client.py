@@ -245,7 +245,7 @@ class SmartleadClient:
             start_hour: str,
             end_hour: str,
             min_time_btw_emails: int,
-            max_leads_per_day: int | None = None,
+            max_new_leads_per_day: int | None = None,
     ) -> dict[str, Any]:
         payload = {
             "timezone": timezone,
@@ -254,8 +254,8 @@ class SmartleadClient:
             "end_hour": end_hour,
             "min_time_btw_emails": min_time_btw_emails,
         }
-        if max_leads_per_day is not None:
-            payload["max_leads_per_day"] = max_leads_per_day
+        if max_new_leads_per_day is not None:
+            payload["max_new_leads_per_day"] = max_new_leads_per_day
 
         return await self._request(
             "POST",

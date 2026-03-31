@@ -132,7 +132,7 @@ class CampaignService:
                     start_hour=schedule.start_hour,
                     end_hour=schedule.end_hour,
                     min_time_btw_emails=schedule.min_time_btw_emails,
-                    max_leads_per_day=schedule.max_leads_per_day,
+                    max_new_leads_per_day=schedule.max_new_leads_per_day,
                 )
                 result["schedule_synced"] = True
                 logger.info("Schedule synced for campaign %s", campaign_id)

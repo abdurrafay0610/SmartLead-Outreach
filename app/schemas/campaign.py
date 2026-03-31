@@ -27,7 +27,7 @@ class ScheduleConfig(BaseModel):
         ...,
         description="Minutes between consecutive emails"
     )
-    max_leads_per_day: Optional[int] = Field(
+    max_new_leads_per_day: Optional[int] = Field(
         None,
         description="Maximum new leads to email per day"
     )
