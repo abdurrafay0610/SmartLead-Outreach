@@ -13,6 +13,7 @@ from app.schemas.campaign import (
     CampaignSettingsRequest,
     CampaignDetailResponse,
 )
+from app.services.campaign_service import CampaignService
 
 router = APIRouter(prefix="/campaigns", tags=["campaigns"])
 
@@ -22,24 +23,30 @@ async def create_campaign(
     request: CampaignCreateRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a new internal campaign. Smartlead campaign is created in Phase 2+."""
-    campaign = InternalCampaign(
+    """
+    Create a new campaign.
+    Creates in both internal DB and Smartlead, stores the provider mapping.
+    """
+    service = CampaignService(db)
+    result = await service.create_campaign_with_sync(
         name=request.name,
         persona=request.persona,
         segment=request.segment,
-        status="drafted",
     )
-    db.add(campaign)
-    await db.flush()
+    campaign = result["campaign"]
+    delivery = result["delivery"]
 
-    # Create a delivery record (Smartlead mapping — provider_campaign_id filled in Phase 2)
-    delivery = CampaignDelivery(
-        internal_campaign_id=campaign.id,
-        provider="smartlead",
-        status="created",
-    )
-    db.add(delivery)
-    await db.flush()
+    if result["smartlead_error"]:
+        return CampaignResponse(
+            id=campaign.id,
+            name=campaign.name,
+            persona=campaign.persona,
+            segment=campaign.segment,
+            status=campaign.status,
+            provider_campaign_id=None,
+            created_at=campaign.created_at,
+            updated_at=campaign.updated_at,
+        )
 
     return CampaignResponse(
         id=campaign.id,
@@ -51,6 +58,22 @@ async def create_campaign(
         created_at=campaign.created_at,
         updated_at=campaign.updated_at,
     )
+
+
+@router.get("/sender-accounts/list")
+async def list_sender_accounts(
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    List all sender email accounts from Smartlead.
+    Use this to find the sender account to assign to a campaign.
+    """
+    service = CampaignService(db)
+    try:
+        accounts = await service.list_sender_accounts()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch from Smartlead: {e}")
+    return {"accounts": accounts}
 
 
 @router.get("/{campaign_id}", response_model=CampaignDetailResponse)
@@ -66,7 +89,6 @@ async def get_campaign(
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
-    # Get delivery for provider_campaign_id
     delivery_result = await db.execute(
         select(CampaignDelivery).where(
             CampaignDelivery.internal_campaign_id == campaign_id
@@ -74,13 +96,14 @@ async def get_campaign(
     )
     delivery = delivery_result.scalar_one_or_none()
 
-    # Count leads
-    lead_count_result = await db.execute(
-        select(func.count(CampaignLeadLink.id)).where(
-            CampaignLeadLink.campaign_delivery_id == delivery.id
+    total_leads = 0
+    if delivery:
+        lead_count_result = await db.execute(
+            select(func.count(CampaignLeadLink.id)).where(
+                CampaignLeadLink.campaign_delivery_id == delivery.id
+            )
         )
-    ) if delivery else None
-    total_leads = lead_count_result.scalar() if lead_count_result else 0
+        total_leads = lead_count_result.scalar() or 0
 
     return CampaignDetailResponse(
         id=campaign.id,
@@ -134,20 +157,16 @@ async def update_campaign_status(
     request: CampaignStatusRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """Update campaign status (start/pause/stop). Smartlead sync in Phase 2+."""
-    result = await db.execute(
-        select(InternalCampaign).where(InternalCampaign.id == campaign_id)
-    )
-    campaign = result.scalar_one_or_none()
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-
-    # Map our verbs to internal status
-    status_map = {"start": "active", "pause": "paused", "stop": "stopped"}
-    campaign.status = status_map[request.status]
-    await db.flush()
-
-    return {"id": str(campaign.id), "status": campaign.status, "message": f"Campaign {request.status}ed"}
+    """
+    Update campaign status (start/pause/stop).
+    Syncs to Smartlead automatically.
+    """
+    service = CampaignService(db)
+    try:
+        result = await service.update_status_with_sync(campaign_id, request.status)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return result
 
 
 @router.post("/{campaign_id}/settings")
@@ -156,28 +175,39 @@ async def update_campaign_settings(
     request: CampaignSettingsRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """Update campaign settings (schedule, sender, limits). Smartlead sync in Phase 2+."""
-    result = await db.execute(
-        select(InternalCampaign).where(InternalCampaign.id == campaign_id)
-    )
-    campaign = result.scalar_one_or_none()
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-
-    # Update sender account on delivery if provided
-    if request.sender_account_id:
-        delivery_result = await db.execute(
-            select(CampaignDelivery).where(
-                CampaignDelivery.internal_campaign_id == campaign_id
-            )
+    """
+    Update campaign settings (schedule, sender, limits).
+    Syncs schedule to Smartlead.
+    """
+    service = CampaignService(db)
+    try:
+        result = await service.configure_campaign(
+            campaign_id=campaign_id,
+            schedule=request.schedule,
+            sender_account_id=request.sender_account_id,
         )
-        delivery = delivery_result.scalar_one_or_none()
-        if delivery:
-            delivery.sender_account_id = request.sender_account_id
-
-    # Schedule and other settings will be synced to Smartlead in Phase 2
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return {
-        "id": str(campaign.id),
-        "message": "Settings updated (Smartlead sync pending Phase 2)",
-        "schedule": request.schedule.model_dump() if request.schedule else None,
+        "id": str(campaign_id),
+        "message": "Settings updated",
+        **result,
     }
+
+
+@router.post("/{campaign_id}/sequences")
+async def setup_sequences(
+    campaign_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Set up sequence templates on Smartlead.
+    Uses {{email_subject}} and {{email_body}} placeholders,
+    which get filled from each lead's custom_fields.
+    """
+    service = CampaignService(db)
+    try:
+        result = await service.setup_sequences(campaign_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"message": "Sequences configured", "smartlead_response": result}
