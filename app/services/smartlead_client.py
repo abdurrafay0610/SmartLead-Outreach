@@ -261,7 +261,7 @@ class SmartleadClient:
         return await self._request(
             "POST",
             f"/campaigns/{campaign_id}/schedule",
-            json_body={"schedule": schedule},
+            json_body=schedule,
         )
 
     async def update_campaign_settings(
