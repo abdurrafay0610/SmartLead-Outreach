@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision = "add_num_emails_per_lead"
-down_revision = None  # TODO: set this to your current head revision ID
+down_revision = "537a85a77311"
 branch_labels = None
 depends_on = None
 
