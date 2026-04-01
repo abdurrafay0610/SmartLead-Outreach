@@ -15,6 +15,7 @@ from app.schemas.campaign import (
     CampaignSettingsRequest,
     CampaignDetailResponse,
     AssignSenderRequest,
+    SequenceSetupRequest,
 )
 from app.services.campaign_service import CampaignService
 
@@ -28,13 +29,27 @@ async def create_campaign(
 ):
     """
     Create a new campaign.
+
     Creates in both internal DB and Smartlead, stores the provider mapping.
+
+    The `num_emails_per_lead` field (default: 1) sets how many sequence
+    steps this campaign will have. When you later inject leads, each lead
+    must provide exactly this many emails.
+
+    Example for a 3-email campaign:
+    ```json
+    {
+      "name": "Q3 Healthcare Outreach",
+      "num_emails_per_lead": 3
+    }
+    ```
     """
     service = CampaignService(db)
     result = await service.create_campaign_with_sync(
         name=request.name,
         persona=request.persona,
         segment=request.segment,
+        num_emails_per_lead=request.num_emails_per_lead,
     )
     campaign = result["campaign"]
     delivery = result["delivery"]
@@ -46,6 +61,7 @@ async def create_campaign(
             persona=campaign.persona,
             segment=campaign.segment,
             status=campaign.status,
+            num_emails_per_lead=campaign.num_emails_per_lead,
             provider_campaign_id=None,
             created_at=campaign.created_at,
             updated_at=campaign.updated_at,
@@ -57,6 +73,7 @@ async def create_campaign(
         persona=campaign.persona,
         segment=campaign.segment,
         status=campaign.status,
+        num_emails_per_lead=campaign.num_emails_per_lead,
         provider_campaign_id=delivery.provider_campaign_id,
         created_at=campaign.created_at,
         updated_at=campaign.updated_at,
@@ -154,6 +171,7 @@ async def get_campaign(
         persona=campaign.persona,
         segment=campaign.segment,
         status=campaign.status,
+        num_emails_per_lead=campaign.num_emails_per_lead,
         provider_campaign_id=delivery.provider_campaign_id if delivery else None,
         total_leads=total_leads,
         created_at=campaign.created_at,
@@ -186,6 +204,7 @@ async def list_campaigns(
                 persona=c.persona,
                 segment=c.segment,
                 status=c.status,
+                num_emails_per_lead=c.num_emails_per_lead,
                 provider_campaign_id=delivery.provider_campaign_id if delivery else None,
                 created_at=c.created_at,
                 updated_at=c.updated_at,
@@ -247,16 +266,47 @@ async def update_campaign_settings(
 @router.post("/{campaign_id}/sequences")
 async def setup_sequences(
     campaign_id: uuid.UUID,
+    request: SequenceSetupRequest | None = None,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Set up sequence templates on Smartlead.
-    Uses {{email_subject}} and {{email_body}} placeholders,
-    which get filled from each lead's custom_fields.
+    Set up sequence templates on Smartlead for multi-step campaigns.
+
+    Creates N sequence steps (where N = num_emails_per_lead from campaign creation).
+    Each step uses numbered placeholders: {{email_subject_1}}, {{email_body_1}}, etc.
+    These get filled from each lead's custom_fields when Smartlead sends.
+
+    **Delay configuration (optional):**
+    You can specify delays between steps. If omitted, defaults are used:
+    - Step 1: 0 days (send immediately)
+    - Step 2: 3 days
+    - Step 3+: 5 days
+
+    Example request body for a 3-email campaign with custom delays:
+    ```json
+    {
+      "step_delays": [
+        {"step_number": 1, "delay_in_days": 0},
+        {"step_number": 2, "delay_in_days": 3},
+        {"step_number": 3, "delay_in_days": 7}
+      ]
+    }
+    ```
+
+    Or call with no body to use default delays.
     """
     service = CampaignService(db)
     try:
-        result = await service.setup_sequences(campaign_id)
+        step_delays = request.step_delays if request else None
+        result = await service.setup_sequences(
+            campaign_id=campaign_id,
+            step_delays=step_delays,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return {"message": "Sequences configured", "smartlead_response": result}
+    return {
+        "message": "Sequences configured",
+        "num_steps": result["num_steps"],
+        "step_delays": result["step_delays"],
+        "smartlead_response": result["smartlead_response"],
+    }

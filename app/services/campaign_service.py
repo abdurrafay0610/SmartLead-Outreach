@@ -9,6 +9,7 @@ Flow:
   3. configure_campaign         → sets schedule/sequences on Smartlead
   4. update_status_with_sync    → updates status in DB + Smartlead
   5. assign_sender_account      → links sender email account to campaign on Smartlead
+  6. setup_sequences            → creates N sequence steps on Smartlead with per-step delays
 """
 
 import logging
@@ -27,11 +28,27 @@ from app.models import (
     OutboundMessage,
     SenderAccount,
 )
-from app.schemas.campaign import CampaignSettingsRequest, ScheduleConfig
+from app.schemas.campaign import CampaignSettingsRequest, ScheduleConfig, SequenceStepDelay
 from app.schemas.lead import LeadEmailInput
 from app.services.smartlead_client import SmartleadClient, get_smartlead_client
 
 logger = logging.getLogger(__name__)
+
+
+# Default delays for sequence steps when not explicitly provided.
+# Step 1 is always 0 (send immediately), subsequent steps add increasing delays.
+DEFAULT_STEP_DELAYS = {
+    1: 0,
+    2: 3,
+    3: 5,
+    4: 7,
+    5: 7,
+    6: 7,
+    7: 10,
+    8: 10,
+    9: 10,
+    10: 14,
+}
 
 
 class CampaignService:
@@ -47,10 +64,18 @@ class CampaignService:
         name: str,
         persona: str | None = None,
         segment: str | None = None,
+        num_emails_per_lead: int = 1,
     ) -> dict[str, Any]:
         """
         Creates a campaign in both internal DB and Smartlead.
         Stores the provider_campaign_id mapping.
+
+        Args:
+            name: Campaign name
+            persona: Optional persona metadata
+            segment: Optional segment metadata
+            num_emails_per_lead: Number of sequence steps (1-10). Each lead
+                                must provide exactly this many emails when injected.
         """
         # 1) Create internal campaign
         campaign = InternalCampaign(
@@ -58,6 +83,7 @@ class CampaignService:
             persona=persona,
             segment=segment,
             status="drafted",
+            num_emails_per_lead=num_emails_per_lead,
         )
         self.db.add(campaign)
         await self.db.flush()
@@ -211,7 +237,7 @@ class CampaignService:
         }
 
     # ------------------------------------------------------------------
-    # 4. Lead injection with Smartlead sync
+    # 4. Lead injection with Smartlead sync (multi-step)
     # ------------------------------------------------------------------
 
     async def inject_leads_with_sync(
@@ -220,17 +246,23 @@ class CampaignService:
         leads_input: list[LeadEmailInput],
     ) -> dict[str, Any]:
         """
-        Full pipeline:
-        1. Upsert leads in DB
-        2. Create campaign-lead links
-        3. Store outbound_message snapshots
-        4. Build Smartlead lead payload with custom_fields (subject/body)
-        5. Push to Smartlead in batches of 400
-        6. Store provider_lead_id mappings
+        Full pipeline for multi-step email campaigns:
+        1. Validate each lead has exactly num_emails_per_lead emails
+        2. Upsert leads in DB
+        3. Create campaign-lead links
+        4. Store outbound_message snapshots (one per step per lead)
+        5. Build Smartlead lead payload with numbered custom_fields
+           (email_subject_1, email_body_1, email_subject_2, email_body_2, ...)
+        6. Push to Smartlead in batches of 400
+        7. Store provider_lead_id mappings
         """
         delivery = await self._get_delivery(campaign_id)
         if not delivery.provider_campaign_id:
             raise ValueError("Campaign has no Smartlead mapping — create it first")
+
+        # Get campaign to check num_emails_per_lead
+        campaign = await self._get_campaign(campaign_id)
+        expected_steps = campaign.num_emails_per_lead
 
         created_count = 0
         skipped_count = 0
@@ -239,6 +271,14 @@ class CampaignService:
 
         for lead_input in leads_input:
             email_lower = lead_input.email.lower()
+
+            # Validate email count matches campaign configuration
+            if len(lead_input.emails) != expected_steps:
+                raise ValueError(
+                    f"Lead {email_lower}: expected {expected_steps} emails "
+                    f"(num_emails_per_lead), got {len(lead_input.emails)}. "
+                    f"Each lead must provide exactly {expected_steps} emails."
+                )
 
             # Upsert lead
             existing_lead_result = await self.db.execute(
@@ -277,38 +317,50 @@ class CampaignService:
             self.db.add(link)
             await self.db.flush()
 
-            # Store immutable email snapshot
-            message = OutboundMessage(
-                campaign_link_id=link.id,
-                step_number=1,
-                subject=lead_input.subject,
-                body_html=lead_input.body_html,
-                body_text=lead_input.body_text,
-                prompt_version=lead_input.prompt_version,
-                model_name=lead_input.model_name,
-                context_snapshot=lead_input.context_snapshot,
-                custom_fields={
-                    "email_subject": lead_input.subject,
-                    "email_body": lead_input.body_html,
-                },
-                message_status="pending",
-                generated_at=datetime.now(timezone.utc),
-            )
-            self.db.add(message)
+            # Build numbered custom_fields for Smartlead
+            # Each step gets its own email_subject_N / email_body_N
+            custom_fields: dict[str, str] = {}
+
+            # Sort emails by step_number to process in order
+            sorted_emails = sorted(lead_input.emails, key=lambda e: e.step_number)
+
+            for step_email in sorted_emails:
+                step_num = step_email.step_number
+
+                # Store immutable email snapshot (one row per step)
+                message = OutboundMessage(
+                    campaign_link_id=link.id,
+                    step_number=step_num,
+                    subject=step_email.subject,
+                    body_html=step_email.body_html,
+                    body_text=step_email.body_text,
+                    prompt_version=step_email.prompt_version,
+                    model_name=step_email.model_name,
+                    context_snapshot=step_email.context_snapshot,
+                    custom_fields={
+                        f"email_subject_{step_num}": step_email.subject,
+                        f"email_body_{step_num}": step_email.body_html,
+                    },
+                    message_status="pending",
+                    generated_at=datetime.now(timezone.utc),
+                )
+                self.db.add(message)
+
+                # Add to the lead-level custom_fields dict
+                custom_fields[f"email_subject_{step_num}"] = step_email.subject
+                custom_fields[f"email_body_{step_num}"] = step_email.body_html
+
             await self.db.flush()
 
             # Build Smartlead lead payload
-            # We pass subject+body as custom_fields so the sequence template
-            # can use {{email_subject}} and {{email_body}}
+            # All step subjects/bodies are passed as numbered custom_fields
+            # so each sequence template can reference {{email_subject_N}}
             sl_lead = {
                 "email": email_lower,
                 "first_name": lead_input.first_name or "",
                 "last_name": lead_input.last_name or "",
                 "company_name": lead_input.company or "",
-                "custom_fields": {
-                    "email_subject": lead_input.subject,
-                    "email_body": lead_input.body_html,
-                },
+                "custom_fields": custom_fields,
             }
             smartlead_leads.append(sl_lead)
             link_map[email_lower] = link
@@ -369,44 +421,87 @@ class CampaignService:
         }
 
     # ------------------------------------------------------------------
-    # 5. Set up sequences on Smartlead
+    # 5. Set up sequences on Smartlead (multi-step)
     # ------------------------------------------------------------------
 
     async def setup_sequences(
         self,
         campaign_id: uuid.UUID,
-        subject_template: str = "{{email_subject}}",
-        body_template: str = "{{email_body}}",
+        step_delays: list[SequenceStepDelay] | None = None,
     ) -> dict[str, Any]:
         """
-        Creates sequence step(s) on Smartlead.
+        Creates N sequence steps on Smartlead, one per num_emails_per_lead.
 
-        Since we pass the actual subject/body as custom_fields per lead,
-        the sequence template just references those variables.
-        Default: subject={{email_subject}}, body={{email_body}}
+        Each step uses numbered placeholder variables:
+          Step 1: subject={{email_subject_1}}, body={{email_body_1}}
+          Step 2: subject={{email_subject_2}}, body={{email_body_2}}
+          ...
+
+        These get filled from each lead's custom_fields when Smartlead sends.
+
+        Args:
+            campaign_id: Internal campaign UUID
+            step_delays: Optional per-step delay config. If not provided,
+                        defaults are used (step 1=0, step 2=3, step N=5+ days).
         """
+        campaign = await self._get_campaign(campaign_id)
         delivery = await self._get_delivery(campaign_id)
         if not delivery.provider_campaign_id:
             raise ValueError("Campaign has no Smartlead mapping")
 
-        sequences = [
-            {
-                "id": None,
-                "seq_number": 1,
-                "subject": subject_template,
-                "email_body": body_template,
-                "seq_delay_details": {"delay_in_days": 0},
-            }
-        ]
+        num_steps = campaign.num_emails_per_lead
+
+        # Build delay lookup from provided config or defaults
+        delay_lookup: dict[int, int] = {}
+        if step_delays:
+            # Validate that the right number of delays were provided
+            if len(step_delays) != num_steps:
+                raise ValueError(
+                    f"Expected {num_steps} step delays (matching num_emails_per_lead), "
+                    f"got {len(step_delays)}."
+                )
+            for sd in step_delays:
+                delay_lookup[sd.step_number] = sd.delay_in_days
+        else:
+            # Use defaults
+            for step in range(1, num_steps + 1):
+                delay_lookup[step] = DEFAULT_STEP_DELAYS.get(step, 7)
+
+        # Ensure step 1 is always delay=0
+        delay_lookup[1] = 0
+
+        # Build sequence list for Smartlead
+        sequences = []
+        for step in range(1, num_steps + 1):
+            sequences.append(
+                {
+                    "id": None,
+                    "seq_number": step,
+                    "subject": "{{" + f"email_subject_{step}" + "}}",
+                    "email_body": "{{" + f"email_body_{step}" + "}}",
+                    "seq_delay_details": {
+                        "delay_in_days": delay_lookup[step],
+                    },
+                }
+            )
 
         async with get_smartlead_client() as sl:
             result = await sl.update_sequences(
                 campaign_id=delivery.provider_campaign_id,
                 sequences=sequences,
             )
-            logger.info("Sequences set for campaign %s", campaign_id)
+            logger.info(
+                "Sequences set for campaign %s: %d steps, delays=%s",
+                campaign_id,
+                num_steps,
+                {s: delay_lookup[s] for s in range(1, num_steps + 1)},
+            )
 
-        return result
+        return {
+            "num_steps": num_steps,
+            "step_delays": {str(s): delay_lookup[s] for s in range(1, num_steps + 1)},
+            "smartlead_response": result,
+        }
 
     # ------------------------------------------------------------------
     # 6. Campaign status management with Smartlead sync

@@ -19,16 +19,70 @@ async def inject_leads(
     """
     Inject leads with pre-generated email content into a campaign.
 
-    Each lead entry contains (email, subject, body_html). The system:
-    1. Upserts the lead record in DB
-    2. Creates the campaign-lead link
-    3. Stores the immutable outbound_message snapshot
-    4. Pushes leads to Smartlead in batches of 400
-    5. Stores provider_lead_id mappings
+    Each lead must provide emails for ALL sequence steps defined at
+    campaign creation (num_emails_per_lead).
 
-    The subject and body are passed to Smartlead as custom_fields
-    ({{email_subject}} and {{email_body}}) so each lead gets their
-    unique personalized content.
+    **Single-email campaign (num_emails_per_lead=1):**
+    ```json
+    {
+      "leads": [
+        {
+          "email": "john@acme.com",
+          "first_name": "John",
+          "company": "Acme Corp",
+          "emails": [
+            {
+              "step_number": 1,
+              "subject": "Quick question about Acme",
+              "body_html": "<p>Hi John, worth a quick chat?</p>"
+            }
+          ]
+        }
+      ]
+    }
+    ```
+
+    **Multi-email campaign (num_emails_per_lead=3):**
+    ```json
+    {
+      "leads": [
+        {
+          "email": "john@acme.com",
+          "first_name": "John",
+          "company": "Acme Corp",
+          "emails": [
+            {
+              "step_number": 1,
+              "subject": "Quick question about Acme",
+              "body_html": "<p>Hi John, noticed Acme is scaling...</p>"
+            },
+            {
+              "step_number": 2,
+              "subject": "Following up, John",
+              "body_html": "<p>Hi John, just checking back in...</p>"
+            },
+            {
+              "step_number": 3,
+              "subject": "Last note from me",
+              "body_html": "<p>Hi John, one final thought...</p>"
+            }
+          ]
+        }
+      ]
+    }
+    ```
+
+    The system:
+    1. Validates each lead has exactly num_emails_per_lead emails
+    2. Upserts the lead record in DB
+    3. Creates the campaign-lead link
+    4. Stores immutable outbound_message snapshots (one per step)
+    5. Pushes leads to Smartlead in batches of 400
+    6. Stores provider_lead_id mappings
+
+    Each step's subject and body are passed to Smartlead as numbered
+    custom_fields (email_subject_1, email_body_1, email_subject_2, etc.)
+    which match the sequence templates set up in POST /campaigns/{id}/sequences.
     """
     service = CampaignService(db)
     try:

@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 # --- Campaign Schemas ---
 
+
 class AssignSenderRequest(BaseModel):
     """
     Assign sender email account(s) to a campaign on Smartlead.
@@ -19,10 +20,45 @@ class AssignSenderRequest(BaseModel):
         examples=[[12345], [12345, 67890]],
     )
 
+
 class CampaignCreateRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=500)
     persona: Optional[str] = None
     segment: Optional[str] = None
+    num_emails_per_lead: int = Field(
+        default=1,
+        ge=1,
+        le=10,
+        description="Number of emails (sequence steps) each lead will receive in this campaign. "
+                    "When injecting leads, you must provide exactly this many emails per lead.",
+        examples=[1, 3],
+    )
+
+
+class SequenceStepDelay(BaseModel):
+    """Delay configuration for a single sequence step."""
+    step_number: int = Field(..., ge=1, le=10, description="Step number (1-based)")
+    delay_in_days: int = Field(
+        ...,
+        ge=0,
+        description="Days to wait after the previous step before sending this email. "
+                    "Step 1 should always be 0.",
+        examples=[0, 3, 5],
+    )
+
+
+class SequenceSetupRequest(BaseModel):
+    """
+    Configure sequence step delays for the campaign.
+    If not provided, defaults will be used:
+    step 1 = 0 days, step 2 = 3 days, step 3 = 5 days, etc.
+    """
+    step_delays: Optional[list[SequenceStepDelay]] = Field(
+        None,
+        description="Optional per-step delay configuration. "
+                    "Must provide exactly num_emails_per_lead entries. "
+                    "If omitted, default delays are used (step 1=0, step 2=3, step 3+=5 days).",
+    )
 
 
 class ScheduleConfig(BaseModel):
@@ -60,6 +96,7 @@ class CampaignResponse(BaseModel):
     persona: Optional[str] = None
     segment: Optional[str] = None
     status: str
+    num_emails_per_lead: int = 1
     provider_campaign_id: Optional[str] = None
     created_at: datetime
     updated_at: datetime
