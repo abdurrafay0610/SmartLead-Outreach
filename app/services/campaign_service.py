@@ -8,6 +8,7 @@ Flow:
   2. inject_leads_with_sync     → stores leads/messages in DB + pushes to Smartlead in batches
   3. configure_campaign         → sets schedule/sequences on Smartlead
   4. update_status_with_sync    → updates status in DB + Smartlead
+  5. assign_sender_account      → links sender email account to campaign on Smartlead
 """
 
 import logging
@@ -141,7 +142,76 @@ class CampaignService:
         return result
 
     # ------------------------------------------------------------------
-    # 3. Lead injection with Smartlead sync
+    # 3. Assign sender email account(s) to campaign on Smartlead
+    # ------------------------------------------------------------------
+
+    async def assign_sender_account(
+        self,
+        campaign_id: uuid.UUID,
+        email_account_ids: list[int],
+    ) -> dict[str, Any]:
+        """
+        Links sender email account(s) to a Smartlead campaign.
+
+        This is REQUIRED before starting a campaign. Without a linked
+        sender account, Smartlead will refuse to send any emails.
+
+        Args:
+            campaign_id: Internal campaign UUID
+            email_account_ids: Smartlead email account IDs (integers).
+                              Get these from GET /sender-accounts/list endpoint.
+
+        Returns:
+            Dict with sync status and Smartlead response.
+        """
+        delivery = await self._get_delivery(campaign_id)
+        if not delivery.provider_campaign_id:
+            raise ValueError("Campaign has no Smartlead mapping — create it first")
+
+        smartlead_error = None
+        smartlead_response = None
+
+        try:
+            async with get_smartlead_client() as sl:
+                smartlead_response = await sl.add_email_account_to_campaign(
+                    campaign_id=delivery.provider_campaign_id,
+                    email_account_ids=email_account_ids,
+                )
+                logger.info(
+                    "Linked email accounts %s to campaign %s (Smartlead ID: %s)",
+                    email_account_ids,
+                    campaign_id,
+                    delivery.provider_campaign_id,
+                )
+        except Exception as e:
+            smartlead_error = str(e)
+            logger.error("Failed to link email accounts to Smartlead campaign: %s", e)
+
+        # Also store the first account locally for reference
+        if email_account_ids and not smartlead_error:
+            # Check if we have a matching local sender_account by provider_account_id
+            first_id = str(email_account_ids[0])
+            existing = await self.db.execute(
+                select(SenderAccount).where(
+                    SenderAccount.provider_account_id == first_id
+                )
+            )
+            sender = existing.scalar_one_or_none()
+            if sender:
+                delivery.sender_account_id = sender.id
+                await self.db.flush()
+
+        return {
+            "campaign_id": str(campaign_id),
+            "provider_campaign_id": delivery.provider_campaign_id,
+            "email_account_ids": email_account_ids,
+            "synced": smartlead_error is None,
+            "smartlead_error": smartlead_error,
+            "smartlead_response": smartlead_response,
+        }
+
+    # ------------------------------------------------------------------
+    # 4. Lead injection with Smartlead sync
     # ------------------------------------------------------------------
 
     async def inject_leads_with_sync(
@@ -299,7 +369,7 @@ class CampaignService:
         }
 
     # ------------------------------------------------------------------
-    # 4. Set up sequences on Smartlead
+    # 5. Set up sequences on Smartlead
     # ------------------------------------------------------------------
 
     async def setup_sequences(
@@ -339,7 +409,7 @@ class CampaignService:
         return result
 
     # ------------------------------------------------------------------
-    # 5. Campaign status management with Smartlead sync
+    # 6. Campaign status management with Smartlead sync
     # ------------------------------------------------------------------
 
     async def update_status_with_sync(
@@ -386,7 +456,7 @@ class CampaignService:
         }
 
     # ------------------------------------------------------------------
-    # 6. List available sender accounts from Smartlead
+    # 7. List available sender accounts from Smartlead
     # ------------------------------------------------------------------
 
     async def list_sender_accounts(self) -> list[dict[str, Any]]:

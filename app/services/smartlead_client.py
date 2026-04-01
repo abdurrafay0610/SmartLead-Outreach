@@ -11,6 +11,7 @@ Endpoint reference:
   - POST /campaigns/{id}/schedule
   - POST /campaigns/{id}/status
   - POST /campaigns/{id}/settings
+  - POST /campaigns/{id}/email-accounts  (link sender to campaign)
   - GET  /campaigns/{id}
   - GET  /email-accounts
   - POST /campaigns/{id}/send-test-email
@@ -393,6 +394,37 @@ class SmartleadClient:
         if isinstance(result, list):
             return result
         return result.get("data", result.get("email_accounts", []))
+
+    async def add_email_account_to_campaign(
+        self,
+        campaign_id: str | int,
+        email_account_ids: list[int],
+    ) -> dict[str, Any]:
+        """
+        POST /campaigns/{campaign_id}/email-accounts
+
+        Links one or more sender email accounts to a campaign.
+        This is REQUIRED before starting a campaign — Smartlead won't
+        send emails without at least one sender account linked.
+
+        Args:
+            campaign_id: Smartlead campaign ID
+            email_account_ids: List of Smartlead email account IDs (integers)
+                              Get these from list_email_accounts()
+
+        Returns:
+            Smartlead API response confirming the accounts were linked.
+        """
+        result = await self._request(
+            "POST",
+            f"/campaigns/{campaign_id}/email-accounts",
+            json_body={"email_account_ids": email_account_ids},
+        )
+        logger.info(
+            "Linked email accounts %s to campaign %s: %s",
+            email_account_ids, campaign_id, result,
+        )
+        return result
 
     # ------------------------------------------------------------------
     # Test email
