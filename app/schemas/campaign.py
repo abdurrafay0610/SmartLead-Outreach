@@ -7,6 +7,17 @@ from pydantic import BaseModel, Field
 
 # --- Campaign Schemas ---
 
+class AssignSenderRequest(BaseModel):
+    """
+    Assign sender email account(s) to a campaign on Smartlead.
+    """
+    email_account_ids: list[int] = Field(
+        ...,
+        min_length=1,
+        description="Smartlead email account IDs (integers). "
+                    "Get these from the /sender-accounts/list endpoint.",
+        examples=[[12345], [12345, 67890]],
+    )
 
 class CampaignCreateRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=500)

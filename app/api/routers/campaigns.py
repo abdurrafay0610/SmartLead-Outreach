@@ -1,6 +1,8 @@
 import uuid
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,6 +14,7 @@ from app.schemas.campaign import (
     CampaignStatusRequest,
     CampaignSettingsRequest,
     CampaignDetailResponse,
+    AssignSenderRequest,
 )
 from app.services.campaign_service import CampaignService
 
@@ -66,7 +69,8 @@ async def list_sender_accounts(
 ):
     """
     List all sender email accounts from Smartlead.
-    Use this to find the sender account to assign to a campaign.
+    Use the 'id' field from the returned accounts when calling
+    POST /campaigns/{id}/sender to link an account to a campaign.
     """
     service = CampaignService(db)
     try:
@@ -74,6 +78,45 @@ async def list_sender_accounts(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to fetch from Smartlead: {e}")
     return {"accounts": accounts}
+
+
+@router.post("/{campaign_id}/sender")
+async def assign_sender_to_campaign(
+    campaign_id: uuid.UUID,
+    request: AssignSenderRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Assign sender email account(s) to a campaign on Smartlead.
+
+    **This is REQUIRED before starting a campaign.** Smartlead will not
+    send emails unless at least one sender account is linked.
+
+    Steps:
+    1. Call GET /api/v1/campaigns/sender-accounts/list to see available accounts
+    2. Pick the account ID(s) you want to use
+    3. Call this endpoint with those IDs
+    4. Then you can start the campaign with POST /campaigns/{id}/status
+
+    You can assign multiple sender accounts for rotation (recommended for
+    better deliverability).
+    """
+    service = CampaignService(db)
+    try:
+        result = await service.assign_sender_account(
+            campaign_id=campaign_id,
+            email_account_ids=request.email_account_ids,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if result.get("smartlead_error"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to link sender on Smartlead: {result['smartlead_error']}",
+        )
+
+    return result
 
 
 @router.get("/{campaign_id}", response_model=CampaignDetailResponse)
@@ -160,6 +203,12 @@ async def update_campaign_status(
     """
     Update campaign status (start/pause/stop).
     Syncs to Smartlead automatically.
+
+    NOTE: Before starting, make sure you have:
+    1. Set up sequences (POST /campaigns/{id}/sequences)
+    2. Added leads (POST /campaigns/{id}/leads)
+    3. Assigned a sender account (POST /campaigns/{id}/sender)
+    4. Configured schedule (POST /campaigns/{id}/settings)
     """
     service = CampaignService(db)
     try:
