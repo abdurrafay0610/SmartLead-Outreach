@@ -30,7 +30,6 @@ class Settings(BaseSettings):
     LEAD_BATCH_SIZE: int = 400
 
     # Google spreadsheet
-    GOOGLE_SHEETS_SPREADSHEET_ID: str = ""
     GOOGLE_SERVICE_ACCOUNT_FILE: str = ""
 
 @lru_cache
