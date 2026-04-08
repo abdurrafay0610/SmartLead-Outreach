@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     # Lead batch size (Smartlead max is 400)
     LEAD_BATCH_SIZE: int = 400
 
+    # Google spreadsheet
+    GOOGLE_SHEETS_SPREADSHEET_ID: str = ""
+    GOOGLE_SERVICE_ACCOUNT_FILE: str = ""
 
 @lru_cache
 def get_settings() -> Settings:
