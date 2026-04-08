@@ -2,10 +2,11 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api.routers import campaigns, health, leads, webhooks
+from app.api.routers import campaigns, health, leads, webhooks, sheet_pollers
 from app.core.config import get_settings
 from app.db.redis import redis_client
 from app.db.session import engine
+from app.services.sheets_poller_service import get_poller_manager
 
 settings = get_settings()
 
@@ -15,7 +16,8 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     # Startup
     yield
-    # Shutdown — clean up connections
+    # Shutdown — stop all pollers gracefully, then clean up connections
+    get_poller_manager().stop_all()
     await engine.dispose()
     await redis_client.aclose()
 
@@ -32,6 +34,7 @@ app.include_router(health.router)
 app.include_router(campaigns.router, prefix="/api/v1")
 app.include_router(leads.router, prefix="/api/v1")
 app.include_router(webhooks.router, prefix="/api/v1")
+app.include_router(sheet_pollers.router, prefix="/api/v1")
 
 
 @app.get("/")
