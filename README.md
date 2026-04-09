@@ -15,17 +15,18 @@ System handles: storage → Smartlead push → event tracking → full audit tra
 outreach-backend/
 ├── app/
 │   ├── api/routers/
-│   │   ├── campaigns.py      # Campaign CRUD + status + sequences + sender
-│   │   ├── leads.py          # Lead injection with multi-step email content
-│   │   ├── webhooks.py       # Smartlead webhook receiver (stub — Phase 4)
-│   │   └── health.py         # Health check endpoint
+│   │   ├── campaigns.py       # Campaign CRUD + status + sequences + sender
+│   │   ├── leads.py           # Lead injection with multi-step email content
+│   │   ├── sheet_pollers.py   # Google Sheets poller start/stop/monitor
+│   │   ├── webhooks.py        # Smartlead webhook receiver (stub — Phase 4)
+│   │   └── health.py          # Health check endpoint
 │   ├── core/
-│   │   └── config.py         # Environment-based settings (Pydantic)
+│   │   └── config.py          # Environment-based settings (Pydantic)
 │   ├── db/
-│   │   ├── base.py           # SQLAlchemy base + mixins (UUID PK, timestamps)
-│   │   ├── session.py        # Async database session + get_db dependency
-│   │   └── redis.py          # Redis async connection
-│   ├── models/               # SQLAlchemy ORM models (8 tables)
+│   │   ├── base.py            # SQLAlchemy base + mixins (UUID PK, timestamps)
+│   │   ├── session.py         # Async database session + get_db dependency
+│   │   └── redis.py           # Redis async connection
+│   ├── models/                # SQLAlchemy ORM models (8 tables)
 │   │   ├── __init__.py        # Re-exports all models
 │   │   ├── lead.py
 │   │   ├── internal_campaign.py
@@ -35,17 +36,19 @@ outreach-backend/
 │   │   ├── outbound_message.py   # ⭐ Core table — immutable email snapshots
 │   │   ├── message_event.py
 │   │   └── webhook_receipt.py
-│   ├── schemas/              # Pydantic request/response models
-│   │   ├── campaign.py       # Create, status, settings, sequences, sender assignment
-│   │   ├── lead.py           # Multi-step lead injection + interaction responses
-│   │   ├── webhook.py        # Webhook receipt response
-│   │   └── common.py         # Health, pagination, error responses
+│   ├── schemas/               # Pydantic request/response models
+│   │   ├── campaign.py        # Create, status, settings, sequences, sender assignment
+│   │   ├── lead.py            # Multi-step lead injection + interaction responses
+│   │   ├── sheets_poller.py   # Sheet poller request/response + lead JSON schema
+│   │   ├── webhook.py         # Webhook receipt response
+│   │   └── common.py          # Health, pagination, error responses
 │   ├── services/
-│   │   ├── smartlead_client.py  # Async httpx wrapper with retries + rate-limit handling
-│   │   └── campaign_service.py  # Orchestration layer (DB ↔ Smartlead sync)
+│   │   ├── smartlead_client.py        # Async httpx wrapper with retries + rate-limit handling
+│   │   ├── campaign_service.py        # Orchestration layer (DB ↔ Smartlead sync)
+│   │   └── sheets_poller_service.py   # Background sheet polling + Smartlead push
 │   └── main.py               # FastAPI app entrypoint + lifespan
 ├── alembic/
-│   ├── env.py                # Async migration runner
+│   ├── env.py                 # Async migration runner
 │   ├── script.py.mako
 │   └── versions/
 │       └── 537a85a77311_initial_schema.py
@@ -60,6 +63,7 @@ outreach-backend/
 - Python 3.11+
 - PostgreSQL (running)
 - Redis (running)
+- Google Cloud service account with Sheets API enabled
 
 ### 2. Install dependencies
 ```bash
@@ -69,7 +73,7 @@ pip install -r requirements.txt
 ### 3. Configure environment
 ```bash
 cp .env.example .env
-# Edit .env with your database, Redis, and Smartlead credentials
+# Edit .env with your database, Redis, Smartlead, and Google credentials
 ```
 
 ### 4. Create the database
@@ -120,6 +124,14 @@ Visit `http://localhost:8000/docs` for the interactive Swagger UI.
 |--------|----------|-------------|
 | POST | `/api/v1/campaigns/{id}/leads` | Inject leads with multi-step email content |
 
+### Sheet Pollers
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/v1/sheet-pollers` | Start a background poller for a Google Sheet |
+| GET | `/api/v1/sheet-pollers` | List all active pollers |
+| GET | `/api/v1/sheet-pollers/{poller_id}` | Get status and stats for a specific poller |
+| POST | `/api/v1/sheet-pollers/{poller_id}/stop` | Gracefully stop a running poller |
+
 ### Webhooks
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -141,6 +153,51 @@ The typical end-to-end flow for sending a campaign:
 ### Multi-Step Email Support
 
 Campaigns support 1–10 sequence steps per lead. At creation time, `num_emails_per_lead` sets the number of steps. When injecting leads, each lead must provide exactly that many emails with sequential step numbers. Each step's subject and body are passed to Smartlead as numbered custom fields (`email_subject_1`, `email_body_1`, etc.) that match the sequence templates.
+
+### Google Sheets Lead Ingestion
+
+For team-based workflows, leads can be added via Google Sheets instead of the API directly.
+
+**How it works:**
+
+1. Start a poller: `POST /api/v1/sheet-pollers` with a spreadsheet ID and sheet name.
+2. Teammates paste lead JSON into **Column A** (one row per lead).
+3. The poller checks for new rows every N seconds (default 60).
+4. For each new row, it validates the JSON and pushes the lead to Smartlead.
+5. The result is written to **Column B** — either `OK - pushed to campaign {id} at {timestamp}` or `ERROR - {details}`.
+
+**Expected JSON format (Column A):**
+```json
+{
+    "campaign_id": 12345,
+    "email": "jane@acme.com",
+    "emails": [
+        {"step_number": 1, "subject": "Hey Jane", "body": "<p>First touch...</p>"},
+        {"step_number": 2, "subject": "Following up", "body": "<p>Checking in...</p>"},
+        {"step_number": 3, "subject": "Quick note", "body": "<p>Thought of...</p>"},
+        {"step_number": 4, "subject": "One more thing", "body": "<p>Wanted to share...</p>"},
+        {"step_number": 5, "subject": "Last touch", "body": "<p>Final note...</p>"}
+    ],
+    "first_name": "Jane",
+    "last_name": "Doe",
+    "company_name": "Acme Corp"
+}
+```
+
+Required fields: `campaign_id`, `email`, `emails` (exactly 5 steps with step_numbers 1–5). Optional fields: `first_name`, `last_name`, `company_name`.
+
+**Notes:**
+- Multiple pollers can run simultaneously on different spreadsheets/sheets.
+- Each spreadsheet+sheet combo can only have one active poller at a time.
+- Rows with a non-empty Column B are always skipped (already processed).
+- To reprocess a failed row, clear Column B and the poller will pick it up again.
+- The Google service account must have **Editor** access to the spreadsheet.
+- All pollers are gracefully stopped when the FastAPI app shuts down.
+
+**Google Sheets setup:**
+1. Create a service account in Google Cloud Console with the Sheets API enabled.
+2. Download the JSON key file and set `GOOGLE_SERVICE_ACCOUNT_FILE` in your `.env`.
+3. Share your spreadsheet with the service account email (found in the JSON key file as `client_email`).
 
 ## Database Schema
 
@@ -172,6 +229,9 @@ Async httpx wrapper with automatic retry on 429 (rate limit) and 5xx errors usin
 ### CampaignService (`app/services/campaign_service.py`)
 Orchestration layer that coordinates internal DB operations with Smartlead API sync. Routers call this service — never Smartlead directly. Handles: campaign creation with provider mapping, multi-step sequence setup, sender assignment, lead injection with batch push, and status updates.
 
+### SheetsPollerService (`app/services/sheets_poller_service.py`)
+Manages background polling tasks for Google Sheets lead ingestion. Each poller runs as an `asyncio.Task` inside the FastAPI event loop. Handles: JSON validation via Pydantic schemas, per-row Smartlead push, status writing to Column B, and graceful stop via `asyncio.Event`. The `PollerManager` singleton prevents duplicate pollers and provides start/stop/list operations.
+
 ## Configuration
 
 Environment variables (see `.env.example`):
@@ -183,6 +243,7 @@ Environment variables (see `.env.example`):
 | `REDIS_URL` | `redis://localhost:6379/0` | Redis connection |
 | `SMARTLEAD_API_KEY` | — | Your Smartlead API key |
 | `SMARTLEAD_BASE_URL` | `https://server.smartlead.ai/api/v1` | Smartlead API base URL |
+| `GOOGLE_SERVICE_ACCOUNT_FILE` | — | Path to Google service account JSON key |
 | `APP_ENV` | `development` | Environment (enables SQL echo in dev) |
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `LEAD_BATCH_SIZE` | `400` | Leads per Smartlead API call (max 400) |
@@ -192,6 +253,7 @@ Environment variables (see `.env.example`):
 - [x] **Phase 1**: Project scaffold + DB schema + basic APIs
 - [x] **Phase 2**: Smartlead API client (async httpx wrapper with retries)
 - [x] **Phase 3**: Campaign + lead management with Smartlead sync
+- [x] **Phase 3.5**: Google Sheets lead ingestion (background pollers)
 - [ ] **Phase 4**: Webhook receiver + event tracking
 - [ ] **Phase 5**: Retrieval + debug APIs
 - [ ] **Phase 6**: Operational hardening
