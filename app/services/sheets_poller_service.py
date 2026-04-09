@@ -92,10 +92,15 @@ class _CampaignCache:
     """
     Caches resolved campaign info (Smartlead ID + sequence count).
 
-    ONLY caches successful lookups (_CampaignInfo). Errors are never
-    cached — they get re-checked on every poll cycle so that transient
-    issues (sequences not yet configured, API blips) resolve automatically
-    once the underlying problem is fixed.
+    Gets sequence count from our own internal DB (num_emails_per_lead)
+    instead of from Smartlead — because Smartlead's GET /campaigns/{id}
+    does NOT include sequences in the response.
+
+    Supports both:
+        - Internal UUIDs → looks up campaign_deliveries + internal_campaigns
+        - Smartlead numeric IDs → reverse-looks up via provider_campaign_id
+
+    ONLY caches successful lookups. Errors are retried every poll cycle.
     """
 
     def __init__(self):
@@ -114,130 +119,94 @@ class _CampaignCache:
         if key in self._cache:
             return self._cache[key]
 
-        # --- Step 1: Resolve to Smartlead numeric ID ---
-        smartlead_id: str | int
         campaign_id_str = str(campaign_id)
-
-        if _is_uuid(campaign_id_str):
-            # It's an internal UUID — look up the Smartlead ID from our DB
-            smartlead_id_or_error, is_error = await self._resolve_uuid_to_smartlead_id(campaign_id_str)
-            if is_error:
-                # It's an error message — DO NOT cache, retry next cycle
-                return smartlead_id_or_error
-            smartlead_id = smartlead_id_or_error
-        else:
-            # Assume it's already a Smartlead numeric ID
-            smartlead_id = campaign_id
-
-        # --- Step 2: Fetch campaign from Smartlead to get sequence count ---
-        try:
-            async with get_smartlead_client() as sl:
-                campaign_data = await sl.get_campaign(smartlead_id)
-        except SmartleadNotFoundError:
-            return f"Campaign {campaign_id} (Smartlead ID: {smartlead_id}) not found on Smartlead"
-        except SmartleadAPIError as e:
-            return f"Failed to fetch campaign {campaign_id} from Smartlead: {e}"
-        except Exception as e:
-            return f"Unexpected error fetching campaign {campaign_id}: {e}"
-
-        # Log the full response so we can debug what Smartlead returns
-        logger.info(
-            "Smartlead GET /campaigns/%s response keys: %s",
-            smartlead_id,
-            list(campaign_data.keys()) if isinstance(campaign_data, dict) else type(campaign_data).__name__,
-        )
-        logger.info(
-            "Smartlead GET /campaigns/%s full response: %s",
-            smartlead_id,
-            json.dumps(campaign_data, default=str)[:2000],  # Truncate to 2000 chars
-        )
-
-        # Extract sequence count — try multiple possible response shapes
-        sequences = None
-        if isinstance(campaign_data, dict):
-            # Try common keys where Smartlead might put sequences
-            for key_name in ("sequences", "sequence_list", "email_sequences", "steps"):
-                if key_name in campaign_data and campaign_data[key_name]:
-                    sequences = campaign_data[key_name]
-                    logger.info(
-                        "Found sequences under key '%s': type=%s, count=%s",
-                        key_name,
-                        type(sequences).__name__,
-                        len(sequences) if isinstance(sequences, list) else "N/A",
-                    )
-                    break
-
-            if sequences is None:
-                # Log all keys and their types to help identify where sequences live
-                logger.warning(
-                    "No sequences found in campaign %s response. "
-                    "Available keys and types: %s",
-                    smartlead_id,
-                    {k: f"{type(v).__name__}({len(v) if isinstance(v, (list, dict)) else v})"
-                     for k, v in campaign_data.items()},
-                )
-
-        count = len(sequences) if isinstance(sequences, list) else 0
-
-        if count == 0:
-            # DO NOT cache — sequences might be added later
-            return (
-                f"Campaign {campaign_id} (Smartlead ID: {smartlead_id}) has no sequences "
-                f"configured on Smartlead. Set up sequences first before adding leads."
-            )
-
-        info = _CampaignInfo(smartlead_id=smartlead_id, sequence_count=count)
-        self._cache[key] = info
-        logger.info(
-            "Cached campaign %s -> Smartlead ID %s, %d sequences",
-            campaign_id, smartlead_id, count,
-        )
-        return info
-
-    async def _resolve_uuid_to_smartlead_id(self, uuid_str: str) -> tuple[str, bool]:
-        """
-        Look up the Smartlead provider_campaign_id for an internal UUID.
-
-        Returns:
-            (smartlead_id, False) on success
-            (error_message, True) on failure
-        """
-        try:
-            parsed_uuid = uuid_module.UUID(uuid_str)
-        except ValueError:
-            return f"'{uuid_str}' looks like a UUID but is not valid", True
 
         try:
             async with async_session_factory() as session:
-                result = await session.execute(
-                    select(CampaignDelivery).where(
-                        CampaignDelivery.internal_campaign_id == parsed_uuid
+                if _is_uuid(campaign_id_str):
+                    # --- UUID path: look up by internal_campaign_id ---
+                    try:
+                        parsed_uuid = uuid_module.UUID(campaign_id_str)
+                    except ValueError:
+                        return f"'{campaign_id_str}' looks like a UUID but is not valid"
+
+                    result = await session.execute(
+                        select(CampaignDelivery).where(
+                            CampaignDelivery.internal_campaign_id == parsed_uuid
+                        )
                     )
-                )
-                delivery = result.scalar_one_or_none()
+                    delivery = result.scalar_one_or_none()
+
+                    if not delivery:
+                        return (
+                            f"Campaign {campaign_id_str} not found in our database. "
+                            f"Make sure you've created this campaign via the API first."
+                        )
+                    if not delivery.provider_campaign_id:
+                        return (
+                            f"Campaign {campaign_id_str} exists but has no Smartlead mapping. "
+                            f"The Smartlead campaign creation may have failed."
+                        )
+
+                    smartlead_id = delivery.provider_campaign_id
+
+                    # Get sequence count from internal_campaigns
+                    from app.models import InternalCampaign
+                    ic_result = await session.execute(
+                        select(InternalCampaign).where(
+                            InternalCampaign.id == parsed_uuid
+                        )
+                    )
+                    internal_campaign = ic_result.scalar_one_or_none()
+                    if not internal_campaign:
+                        return f"Internal campaign {campaign_id_str} not found"
+
+                    sequence_count = internal_campaign.num_emails_per_lead
+
+                else:
+                    # --- Numeric path: reverse-look up by provider_campaign_id ---
+                    result = await session.execute(
+                        select(CampaignDelivery).where(
+                            CampaignDelivery.provider_campaign_id == campaign_id_str
+                        )
+                    )
+                    delivery = result.scalar_one_or_none()
+
+                    if not delivery:
+                        return (
+                            f"Smartlead campaign ID {campaign_id_str} not found in our database. "
+                            f"Either use your internal UUID or make sure this campaign "
+                            f"was created through our system."
+                        )
+
+                    smartlead_id = delivery.provider_campaign_id
+
+                    # Get sequence count from internal_campaigns
+                    from app.models import InternalCampaign
+                    ic_result = await session.execute(
+                        select(InternalCampaign).where(
+                            InternalCampaign.id == delivery.internal_campaign_id
+                        )
+                    )
+                    internal_campaign = ic_result.scalar_one_or_none()
+                    if not internal_campaign:
+                        return f"Internal campaign for Smartlead ID {campaign_id_str} not found"
+
+                    sequence_count = internal_campaign.num_emails_per_lead
+
         except Exception as e:
-            return f"Database error looking up campaign {uuid_str}: {e}", True
+            return f"Database error resolving campaign {campaign_id}: {e}"
 
-        if not delivery:
-            return (
-                f"Campaign {uuid_str} not found in our database. "
-                f"Make sure you've created this campaign via the API first."
-            ), True
-
-        if not delivery.provider_campaign_id:
-            return (
-                f"Campaign {uuid_str} exists in our database but has no "
-                f"Smartlead mapping. The Smartlead campaign creation may have failed."
-            ), True
-
+        info = _CampaignInfo(smartlead_id=smartlead_id, sequence_count=sequence_count)
+        self._cache[key] = info
         logger.info(
-            "Resolved UUID %s -> Smartlead ID %s",
-            uuid_str, delivery.provider_campaign_id,
+            "Cached campaign %s -> Smartlead ID %s, %d sequences",
+            campaign_id, smartlead_id, sequence_count,
         )
-        return delivery.provider_campaign_id, False
+        return info
 
     def invalidate(self, campaign_id: int | str):
-        """Remove a campaign from cache (e.g., if we suspect stale data)."""
+        """Remove a campaign from cache."""
         self._cache.pop(str(campaign_id), None)
 
     def clear(self):
