@@ -1,4 +1,3 @@
-
 ---
 
 # 📄 AI Outreach System – Technical Design Report
@@ -29,14 +28,26 @@ The system should:
      * body
    * Support hyper-personalized emails (LLM-generated)
    * Associate each lead with a campaign
+   * Support ingestion via Google Sheets for team-based workflows
 
-3. **Email Sending (via Smartlead)**
+3. **Google Sheets Lead Ingestion**
+
+   * Start/stop background pollers via API for any spreadsheet + sheet tab
+   * Run multiple pollers simultaneously on different sheets
+   * Validate lead JSON pasted by teammates (schema, required fields, step count)
+   * Push validated leads directly to Smartlead with per-step custom fields
+   * Write processing status (OK/ERROR with details) back to the sheet
+   * Skip already-processed rows (idempotent — only processes rows with empty status column)
+   * Prevent duplicate pollers on the same spreadsheet+sheet combination
+   * Gracefully stop all pollers on application shutdown
+
+4. **Email Sending (via Smartlead)**
 
    * Push campaigns and leads via API
    * Map internal campaigns to Smartlead campaigns
    * Track provider IDs (campaign, lead, message)
 
-4. **Event Tracking**
+5. **Event Tracking**
 
    * Track lifecycle events:
 
@@ -49,7 +60,7 @@ The system should:
    * Store timestamps for each event
    * Store raw webhook payloads
 
-5. **Audit & Debugging**
+6. **Audit & Debugging**
 
    * Retrieve all interactions for a given email
    * Retrieve full campaign data
@@ -57,7 +68,7 @@ The system should:
    * View event timelines
    * Maintain immutable message snapshots
 
-6. **Data Persistence**
+7. **Data Persistence**
 
    * Store:
 
@@ -73,11 +84,12 @@ The system should:
 ### Non-Functional Requirements
 
 * **Traceability**: Every email must be reconstructable
-* **Idempotency**: Webhooks and retries must not duplicate data
+* **Idempotency**: Webhooks, retries, and sheet polling must not duplicate data
 * **Scalability**: Support thousands of leads per campaign
 * **Performance**: Fast retrieval by email and campaign
 * **Extensibility**: Support multiple providers in future
 * **Reliability**: No data loss on webhook failures
+* **Concurrency**: Multiple background pollers running simultaneously without blocking the API
 
 ---
 
@@ -103,6 +115,7 @@ You implicitly need:
 * **Monitoring capability**
 
   * basic dashboard or debug API
+  * poller status and stats via API
 
 ---
 
@@ -390,6 +403,14 @@ Fields:
 * Insert leads into DB
 * Create campaign_lead_links
 
+**Via API:**
+* POST request with lead + email content per step
+
+**Via Google Sheets:**
+* Teammates paste JSON into Column A of a shared spreadsheet
+* Background poller validates and pushes directly to Smartlead
+* Status written to Column B (OK or ERROR with details)
+
 ---
 
 ### Step 3: Message Generation
@@ -470,6 +491,13 @@ Output:
 
 * `POST /campaigns/{id}/leads`
 
+#### Sheet Pollers
+
+* `POST /sheet-pollers` — start a background poller for a Google Sheet
+* `GET /sheet-pollers` — list all active pollers
+* `GET /sheet-pollers/{poller_id}` — get status and stats for a poller
+* `POST /sheet-pollers/{poller_id}/stop` — gracefully stop a poller
+
 #### Webhooks
 
 * `POST /webhooks/smartlead`
@@ -498,6 +526,7 @@ Output:
 
   * provider_event_id OR
   * hash(payload)
+* Sheet poller skips rows with non-empty Column B (already processed)
 
 ---
 
@@ -532,6 +561,24 @@ Campaign: Healthcare Outreach
 
 ---
 
+## Poller Monitoring
+
+For any active poller:
+
+```text
+Poller: abc12345
+  Sheet: "1umOtK_TRT8..." / Sheet1
+  Status: running
+  Rows processed: 47
+  Rows succeeded: 44
+  Rows failed: 3
+  Last poll: 2026-04-09 14:30:00 UTC
+```
+
+Available via `GET /api/v1/sheet-pollers` and `GET /api/v1/sheet-pollers/{poller_id}`.
+
+---
+
 ## Debug Capabilities
 
 * Search by email
@@ -539,6 +586,7 @@ Campaign: Healthcare Outreach
 * View message content
 * View event timeline
 * View raw webhook payload
+* Monitor active sheet pollers and their processing stats
 
 ---
 
@@ -559,6 +607,7 @@ Supports:
 * multiple providers
 * multiple campaigns
 * multiple sends per lead
+* team-based lead ingestion via Google Sheets
 
 ### 4. Scalable
 
@@ -566,6 +615,7 @@ Handles:
 
 * large campaigns
 * multiple events per message
+* concurrent background pollers without blocking the API
 
 ---
 
@@ -603,13 +653,54 @@ Later:
 
 ---
 
-## 4.4 Future Enhancements
+## 4.4 Google Sheets Integration Setup
+
+Prerequisites:
+
+* Google Cloud project with Sheets API enabled
+* Service account with JSON key file
+* Spreadsheet shared with the service account email (Editor access)
+
+Configuration:
+
+* `GOOGLE_SERVICE_ACCOUNT_FILE` env var pointing to the JSON key file
+
+Sheet layout:
+
+* Column A: Lead JSON (one per row, pasted by teammates)
+* Column B: Processing status (written by the poller)
+
+JSON format (Column A):
+```json
+{
+    "campaign_id": 12345,
+    "email": "jane@acme.com",
+    "emails": [
+        {"step_number": 1, "subject": "Hey Jane", "body": "<p>First touch...</p>"},
+        {"step_number": 2, "subject": "Following up", "body": "<p>Checking in...</p>"},
+        {"step_number": 3, "subject": "Quick note", "body": "<p>Thought of...</p>"},
+        {"step_number": 4, "subject": "One more thing", "body": "<p>Wanted to share...</p>"},
+        {"step_number": 5, "subject": "Last touch", "body": "<p>Final note...</p>"}
+    ],
+    "first_name": "Jane",
+    "last_name": "Doe",
+    "company_name": "Acme Corp"
+}
+```
+
+Required: `campaign_id`, `email`, `emails` (exactly 5 steps with step_numbers 1–5).
+Optional: `first_name`, `last_name`, `company_name`.
+
+---
+
+## 4.5 Future Enhancements
 
 * campaign analytics aggregation
 * bounce rate monitoring
 * auto-pause campaigns
 * reply classification (AI)
 * lead scoring
+* Google Sheets error column with structured error codes for programmatic retry
 
 ---
 
@@ -622,7 +713,6 @@ This system is designed to:
 * Store **immutable message snapshots**
 * Track **full event timelines**
 * Enable **email-based and campaign-based debugging**
+* Support **team-based lead ingestion via Google Sheets** with background polling
 
 ---
-
-
