@@ -92,13 +92,14 @@ class _CampaignCache:
     """
     Caches resolved campaign info (Smartlead ID + sequence count).
 
-    Stores either:
-        campaign_id -> _CampaignInfo  for valid campaigns
-        campaign_id -> error_string   for invalid/errored campaigns
+    ONLY caches successful lookups (_CampaignInfo). Errors are never
+    cached — they get re-checked on every poll cycle so that transient
+    issues (sequences not yet configured, API blips) resolve automatically
+    once the underlying problem is fixed.
     """
 
     def __init__(self):
-        self._cache: dict[str, _CampaignInfo | str] = {}
+        self._cache: dict[str, _CampaignInfo] = {}
 
     async def resolve(self, campaign_id: int | str) -> _CampaignInfo | str:
         """
@@ -121,8 +122,7 @@ class _CampaignCache:
             # It's an internal UUID — look up the Smartlead ID from our DB
             resolved = await self._resolve_uuid_to_smartlead_id(campaign_id_str)
             if isinstance(resolved, str):
-                # It's an error message
-                self._cache[key] = resolved
+                # It's an error message — DO NOT cache, retry next cycle
                 return resolved
             smartlead_id = resolved
         else:
@@ -134,29 +134,22 @@ class _CampaignCache:
             async with get_smartlead_client() as sl:
                 campaign_data = await sl.get_campaign(smartlead_id)
         except SmartleadNotFoundError:
-            error = f"Campaign {campaign_id} (Smartlead ID: {smartlead_id}) not found on Smartlead"
-            self._cache[key] = error
-            return error
+            return f"Campaign {campaign_id} (Smartlead ID: {smartlead_id}) not found on Smartlead"
         except SmartleadAPIError as e:
-            error = f"Failed to fetch campaign {campaign_id} from Smartlead: {e}"
-            self._cache[key] = error
-            return error
+            return f"Failed to fetch campaign {campaign_id} from Smartlead: {e}"
         except Exception as e:
-            error = f"Unexpected error fetching campaign {campaign_id}: {e}"
-            self._cache[key] = error
-            return error
+            return f"Unexpected error fetching campaign {campaign_id}: {e}"
 
         # Extract sequence count
         sequences = campaign_data.get("sequences") or []
         count = len(sequences) if isinstance(sequences, list) else 0
 
         if count == 0:
-            error = (
+            # DO NOT cache — sequences might be added later
+            return (
                 f"Campaign {campaign_id} (Smartlead ID: {smartlead_id}) has no sequences "
                 f"configured on Smartlead. Set up sequences first before adding leads."
             )
-            self._cache[key] = error
-            return error
 
         info = _CampaignInfo(smartlead_id=smartlead_id, sequence_count=count)
         self._cache[key] = info
