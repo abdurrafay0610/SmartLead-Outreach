@@ -39,9 +39,7 @@ async def start_poller(request: PollerStartRequest):
         "emails": [
             {"step_number": 1, "subject": "Hey Jane", "body": "<p>...</p>"},
             {"step_number": 2, "subject": "Following up", "body": "<p>...</p>"},
-            {"step_number": 3, "subject": "Quick note", "body": "<p>...</p>"},
-            {"step_number": 4, "subject": "One more thing", "body": "<p>...</p>"},
-            {"step_number": 5, "subject": "Last touch", "body": "<p>...</p>"}
+            {"step_number": 3, "subject": "Quick note", "body": "<p>...</p>"}
         ],
         "first_name": "Jane",
         "last_name": "Doe",
@@ -49,13 +47,29 @@ async def start_poller(request: PollerStartRequest):
     }
     ```
 
-    Required fields: `campaign_id`, `email`, `emails` (exactly 5 steps).
+    Required fields: `campaign_id`, `email`, `emails`.
     Optional fields: `first_name`, `last_name`, `company_name`.
+
+    **The number of emails must match the campaign's sequence count on Smartlead.**
+    For example, if the campaign has 3 sequences, provide exactly 3 emails
+    with step_numbers 1, 2, 3. If there's a mismatch, the row gets an error
+    like: "Email count mismatch: campaign 12345 has 3 sequence(s), but you
+    provided 5 email(s)."
+
+    **Validation errors written to Column B include:**
+    - Invalid JSON syntax
+    - Missing required fields (`campaign_id`, `email`, `emails`)
+    - Invalid campaign ID (not found on Smartlead)
+    - Campaign has no sequences configured
+    - Email count doesn't match campaign's sequence count
+    - Any Smartlead API errors during lead push
 
     **Notes:**
     - Each spreadsheet+sheet combination can only have one active poller.
     - The poller runs as a background task — this endpoint returns immediately.
     - Rows already processed (Column B not empty) are skipped.
+    - Campaign info is cached per poller — the first row with a new campaign_id
+      triggers a Smartlead API call, subsequent rows reuse the cached result.
     - Make sure the service account has Editor access to the spreadsheet.
     """
     manager = get_poller_manager()

@@ -21,16 +21,19 @@ class SheetLeadJSON(BaseModel):
     """
     Schema for the JSON that teammates paste into Column A.
 
-    Required fields: campaign_id, email, emails (exactly 5 steps).
+    Required fields: campaign_id, email, emails.
     Optional fields: first_name, last_name, company_name.
+
+    The number of emails must match the campaign's sequence count
+    (validated at runtime against Smartlead, not hardcoded here).
     """
     campaign_id: int | str = Field(..., description="Smartlead campaign ID")
     email: str = Field(..., description="Lead email address")
     emails: list[SheetStepEmail] = Field(
         ...,
-        min_length=5,
-        max_length=5,
-        description="Exactly 5 email steps",
+        min_length=1,
+        max_length=10,
+        description="Email steps — count must match the campaign's sequence count",
     )
     first_name: str = ""
     last_name: str = ""

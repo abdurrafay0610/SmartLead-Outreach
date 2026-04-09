@@ -9,6 +9,15 @@ Architecture:
     - Each poller runs as an asyncio.Task in the FastAPI event loop
     - Start/stop via the router endpoints
     - No database involvement — purely Smartlead push
+
+Campaign validation:
+    - On first encounter of a campaign_id, fetches the campaign from Smartlead
+      to determine how many sequences (email steps) it has.
+    - Caches the result so subsequent rows with the same campaign_id don't
+      re-fetch.
+    - If the campaign doesn't exist on Smartlead, the row gets an error.
+    - If the number of emails in the JSON doesn't match the campaign's
+      sequence count, the row gets a descriptive error.
 """
 
 import asyncio
@@ -24,7 +33,11 @@ from pydantic import ValidationError
 
 from app.core.config import get_settings
 from app.schemas.sheets_poller import PollerInfo, SheetLeadJSON
-from app.services.smartlead_client import get_smartlead_client
+from app.services.smartlead_client import (
+    SmartleadAPIError,
+    SmartleadNotFoundError,
+    get_smartlead_client,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +60,90 @@ def _get_gspread_client() -> gspread.Client:
 
 
 # ---------------------------------------------------------------------------
+# Campaign sequence cache
+# ---------------------------------------------------------------------------
+
+class _CampaignCache:
+    """
+    Caches campaign sequence counts fetched from Smartlead.
+
+    Stores either:
+        campaign_id -> sequence_count (int)  for valid campaigns
+        campaign_id -> error_string (str)    for invalid/errored campaigns
+    """
+
+    def __init__(self):
+        self._cache: dict[str, int | str] = {}
+
+    async def get_sequence_count(self, campaign_id: int | str) -> int | str:
+        """
+        Get the number of sequences for a campaign.
+
+        Returns:
+            int: sequence count (success)
+            str: error message (failure — campaign not found, API error, etc.)
+        """
+        key = str(campaign_id)
+        if key in self._cache:
+            return self._cache[key]
+
+        # Fetch from Smartlead
+        try:
+            async with get_smartlead_client() as sl:
+                campaign_data = await sl.get_campaign(campaign_id)
+        except SmartleadNotFoundError:
+            error = f"Campaign {campaign_id} not found on Smartlead"
+            self._cache[key] = error
+            return error
+        except SmartleadAPIError as e:
+            error = f"Failed to fetch campaign {campaign_id}: {e}"
+            self._cache[key] = error
+            return error
+        except Exception as e:
+            error = f"Unexpected error fetching campaign {campaign_id}: {e}"
+            self._cache[key] = error
+            return error
+
+        # Extract sequence count from the campaign response
+        # Smartlead returns sequences as a list in the campaign object
+        sequences = campaign_data.get("sequences") or []
+        if isinstance(sequences, list):
+            count = len(sequences)
+        else:
+            count = 0
+
+        if count == 0:
+            error = (
+                f"Campaign {campaign_id} has no sequences configured on Smartlead. "
+                f"Set up sequences first before adding leads."
+            )
+            self._cache[key] = error
+            return error
+
+        self._cache[key] = count
+        logger.info("Cached campaign %s: %d sequences", campaign_id, count)
+        return count
+
+    def invalidate(self, campaign_id: int | str):
+        """Remove a campaign from cache (e.g., if we suspect stale data)."""
+        self._cache.pop(str(campaign_id), None)
+
+    def clear(self):
+        """Clear entire cache."""
+        self._cache.clear()
+
+
+# ---------------------------------------------------------------------------
 # Single-row processing
 # ---------------------------------------------------------------------------
 
 def validate_row_json(raw_text: str) -> tuple[SheetLeadJSON | None, str | None]:
     """
     Parse and validate JSON from a sheet cell using the Pydantic schema.
+
+    This does basic structural validation only (required fields, types).
+    Campaign-specific validation (email count vs sequence count) is done
+    separately after this passes.
 
     Returns:
         (parsed_model, None) on success
@@ -82,12 +173,44 @@ def validate_row_json(raw_text: str) -> tuple[SheetLeadJSON | None, str | None]:
     if "@" not in model.email:
         return None, "'email' must be a valid email address"
 
-    # Step 4: check step_numbers are exactly 1-5
+    # Step 4: check step_numbers are sequential 1..N with no gaps
     step_numbers = sorted(e.step_number for e in model.emails)
-    if step_numbers != [1, 2, 3, 4, 5]:
-        return None, f"Step numbers must be [1,2,3,4,5], got {step_numbers}"
+    expected = list(range(1, len(model.emails) + 1))
+    if step_numbers != expected:
+        return None, f"Step numbers must be sequential {expected}, got {step_numbers}"
 
     return model, None
+
+
+async def validate_against_campaign(
+    lead: SheetLeadJSON,
+    campaign_cache: _CampaignCache,
+) -> str | None:
+    """
+    Validate that the lead's email count matches the campaign's sequence count.
+
+    Returns:
+        None if valid
+        Error string if there's a mismatch or the campaign is invalid
+    """
+    result = await campaign_cache.get_sequence_count(lead.campaign_id)
+
+    # If result is a string, it's an error message
+    if isinstance(result, str):
+        return result
+
+    # result is an int — the expected sequence count
+    expected_count = result
+    actual_count = len(lead.emails)
+
+    if actual_count != expected_count:
+        return (
+            f"Email count mismatch: campaign {lead.campaign_id} has "
+            f"{expected_count} sequence(s), but you provided {actual_count} email(s). "
+            f"Provide exactly {expected_count} email(s) with step_numbers 1 through {expected_count}."
+        )
+
+    return None
 
 
 async def push_lead_to_smartlead(lead: SheetLeadJSON) -> str:
@@ -96,6 +219,10 @@ async def push_lead_to_smartlead(lead: SheetLeadJSON) -> str:
 
     Returns:
         Status string for Column B.
+
+    Raises:
+        Any Smartlead exception — caller is responsible for catching and
+        writing the error to the sheet.
     """
     # Build the lead payload matching add_leads_to_campaign format
     custom_fields: dict[str, str] = {}
@@ -149,6 +276,9 @@ class _PollerState:
         self.last_error: str | None = None
         self.task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
+        # Per-poller campaign cache — avoids re-fetching campaign info
+        # for every single row with the same campaign_id
+        self.campaign_cache = _CampaignCache()
 
     def request_stop(self):
         self._stop_event.set()
@@ -252,23 +382,50 @@ async def _poll_once(state: _PollerState, sheet: gspread.Worksheet):
 
         logger.info("Poller %s processing row %d", state.poller_id, row_num)
 
-        # Validate JSON
+        # --- Phase 1: Basic JSON/schema validation ---
         lead, error = validate_row_json(col_a)
 
         if error:
             status_text = f"ERROR - {error}"
             state.rows_failed += 1
             logger.warning("Poller %s row %d validation error: %s", state.poller_id, row_num, error)
+
         else:
-            # Push to Smartlead
-            try:
-                status_text = await push_lead_to_smartlead(lead)
-                state.rows_succeeded += 1
-                logger.info("Poller %s row %d: %s", state.poller_id, row_num, status_text)
-            except Exception as e:
-                status_text = f"ERROR - Smartlead: {e}"
+            # --- Phase 2: Campaign validation (exists? email count matches?) ---
+            campaign_error = await validate_against_campaign(lead, state.campaign_cache)
+
+            if campaign_error:
+                status_text = f"ERROR - {campaign_error}"
                 state.rows_failed += 1
-                logger.error("Poller %s row %d Smartlead error: %s", state.poller_id, row_num, e)
+                logger.warning(
+                    "Poller %s row %d campaign validation error: %s",
+                    state.poller_id, row_num, campaign_error,
+                )
+
+            else:
+                # --- Phase 3: Push to Smartlead ---
+                try:
+                    status_text = await push_lead_to_smartlead(lead)
+                    state.rows_succeeded += 1
+                    logger.info("Poller %s row %d: %s", state.poller_id, row_num, status_text)
+
+                except SmartleadNotFoundError as e:
+                    # Campaign was valid when cached but now returns 404
+                    # Invalidate cache so next row re-checks
+                    state.campaign_cache.invalidate(lead.campaign_id)
+                    status_text = f"ERROR - Campaign {lead.campaign_id} not found on Smartlead: {e}"
+                    state.rows_failed += 1
+                    logger.error("Poller %s row %d: %s", state.poller_id, row_num, status_text)
+
+                except SmartleadAPIError as e:
+                    status_text = f"ERROR - Smartlead API error: {e}"
+                    state.rows_failed += 1
+                    logger.error("Poller %s row %d Smartlead error: %s", state.poller_id, row_num, e)
+
+                except Exception as e:
+                    status_text = f"ERROR - Unexpected: {e}"
+                    state.rows_failed += 1
+                    logger.error("Poller %s row %d unexpected error: %s", state.poller_id, row_num, e)
 
         state.rows_processed += 1
 
