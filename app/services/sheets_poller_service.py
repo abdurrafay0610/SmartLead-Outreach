@@ -8,14 +8,16 @@ Architecture:
     - PollerManager: singleton that tracks all running pollers
     - Each poller runs as an asyncio.Task in the FastAPI event loop
     - Start/stop via the router endpoints
-    - No database involvement — purely Smartlead push
+
+Campaign ID resolution:
+    - Accepts both internal UUIDs and Smartlead numeric IDs.
+    - If a UUID is detected, looks up the Smartlead provider_campaign_id
+      from the campaign_deliveries table.
+    - Then fetches the campaign from Smartlead to get the sequence count.
+    - Caches both the resolved Smartlead ID and sequence count.
 
 Campaign validation:
-    - On first encounter of a campaign_id, fetches the campaign from Smartlead
-      to determine how many sequences (email steps) it has.
-    - Caches the result so subsequent rows with the same campaign_id don't
-      re-fetch.
-    - If the campaign doesn't exist on Smartlead, the row gets an error.
+    - If the campaign doesn't exist (DB or Smartlead), the row gets an error.
     - If the number of emails in the JSON doesn't match the campaign's
       sequence count, the row gets a descriptive error.
 """
@@ -23,15 +25,20 @@ Campaign validation:
 import asyncio
 import json
 import logging
-import uuid
+import re
+import uuid as uuid_module
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 import gspread
 from google.oauth2.service_account import Credentials
 from pydantic import ValidationError
+from sqlalchemy import select
 
 from app.core.config import get_settings
+from app.db.session import async_session_factory
+from app.models import CampaignDelivery
 from app.schemas.sheets_poller import PollerInfo, SheetLeadJSON
 from app.services.smartlead_client import (
     SmartleadAPIError,
@@ -44,6 +51,17 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+# Regex to detect UUIDs (with or without hyphens)
+_UUID_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def _is_uuid(value: str) -> bool:
+    """Check if a string looks like a UUID."""
+    return bool(_UUID_PATTERN.match(value))
 
 
 # ---------------------------------------------------------------------------
@@ -60,43 +78,67 @@ def _get_gspread_client() -> gspread.Client:
 
 
 # ---------------------------------------------------------------------------
-# Campaign sequence cache
+# Campaign info cache
 # ---------------------------------------------------------------------------
+
+@dataclass
+class _CampaignInfo:
+    """Resolved campaign info — cached after first lookup."""
+    smartlead_id: str | int  # The actual Smartlead numeric campaign ID
+    sequence_count: int
+
 
 class _CampaignCache:
     """
-    Caches campaign sequence counts fetched from Smartlead.
+    Caches resolved campaign info (Smartlead ID + sequence count).
 
     Stores either:
-        campaign_id -> sequence_count (int)  for valid campaigns
-        campaign_id -> error_string (str)    for invalid/errored campaigns
+        campaign_id -> _CampaignInfo  for valid campaigns
+        campaign_id -> error_string   for invalid/errored campaigns
     """
 
     def __init__(self):
-        self._cache: dict[str, int | str] = {}
+        self._cache: dict[str, _CampaignInfo | str] = {}
 
-    async def get_sequence_count(self, campaign_id: int | str) -> int | str:
+    async def resolve(self, campaign_id: int | str) -> _CampaignInfo | str:
         """
-        Get the number of sequences for a campaign.
+        Resolve a campaign_id (UUID or Smartlead numeric ID) to its
+        Smartlead ID and sequence count.
 
         Returns:
-            int: sequence count (success)
-            str: error message (failure — campaign not found, API error, etc.)
+            _CampaignInfo on success
+            str (error message) on failure
         """
         key = str(campaign_id)
         if key in self._cache:
             return self._cache[key]
 
-        # Fetch from Smartlead
+        # --- Step 1: Resolve to Smartlead numeric ID ---
+        smartlead_id: str | int
+        campaign_id_str = str(campaign_id)
+
+        if _is_uuid(campaign_id_str):
+            # It's an internal UUID — look up the Smartlead ID from our DB
+            resolved = await self._resolve_uuid_to_smartlead_id(campaign_id_str)
+            if isinstance(resolved, str):
+                # It's an error message
+                self._cache[key] = resolved
+                return resolved
+            smartlead_id = resolved
+        else:
+            # Assume it's already a Smartlead numeric ID
+            smartlead_id = campaign_id
+
+        # --- Step 2: Fetch campaign from Smartlead to get sequence count ---
         try:
             async with get_smartlead_client() as sl:
-                campaign_data = await sl.get_campaign(campaign_id)
+                campaign_data = await sl.get_campaign(smartlead_id)
         except SmartleadNotFoundError:
-            error = f"Campaign {campaign_id} not found on Smartlead"
+            error = f"Campaign {campaign_id} (Smartlead ID: {smartlead_id}) not found on Smartlead"
             self._cache[key] = error
             return error
         except SmartleadAPIError as e:
-            error = f"Failed to fetch campaign {campaign_id}: {e}"
+            error = f"Failed to fetch campaign {campaign_id} from Smartlead: {e}"
             self._cache[key] = error
             return error
         except Exception as e:
@@ -104,25 +146,67 @@ class _CampaignCache:
             self._cache[key] = error
             return error
 
-        # Extract sequence count from the campaign response
-        # Smartlead returns sequences as a list in the campaign object
+        # Extract sequence count
         sequences = campaign_data.get("sequences") or []
-        if isinstance(sequences, list):
-            count = len(sequences)
-        else:
-            count = 0
+        count = len(sequences) if isinstance(sequences, list) else 0
 
         if count == 0:
             error = (
-                f"Campaign {campaign_id} has no sequences configured on Smartlead. "
-                f"Set up sequences first before adding leads."
+                f"Campaign {campaign_id} (Smartlead ID: {smartlead_id}) has no sequences "
+                f"configured on Smartlead. Set up sequences first before adding leads."
             )
             self._cache[key] = error
             return error
 
-        self._cache[key] = count
-        logger.info("Cached campaign %s: %d sequences", campaign_id, count)
-        return count
+        info = _CampaignInfo(smartlead_id=smartlead_id, sequence_count=count)
+        self._cache[key] = info
+        logger.info(
+            "Cached campaign %s -> Smartlead ID %s, %d sequences",
+            campaign_id, smartlead_id, count,
+        )
+        return info
+
+    async def _resolve_uuid_to_smartlead_id(self, uuid_str: str) -> int | str:
+        """
+        Look up the Smartlead provider_campaign_id for an internal UUID.
+
+        Returns:
+            int/str: Smartlead campaign ID on success
+            str: error message on failure
+        """
+        try:
+            parsed_uuid = uuid_module.UUID(uuid_str)
+        except ValueError:
+            return f"'{uuid_str}' looks like a UUID but is not valid"
+
+        try:
+            async with async_session_factory() as session:
+                result = await session.execute(
+                    select(CampaignDelivery).where(
+                        CampaignDelivery.internal_campaign_id == parsed_uuid
+                    )
+                )
+                delivery = result.scalar_one_or_none()
+        except Exception as e:
+            return f"Database error looking up campaign {uuid_str}: {e}"
+
+        if not delivery:
+            return (
+                f"Campaign {uuid_str} not found in our database. "
+                f"Make sure you've created this campaign via the API first."
+            )
+
+        if not delivery.provider_campaign_id:
+            return (
+                f"Campaign {uuid_str} exists in our database but has no "
+                f"Smartlead mapping. The Smartlead campaign creation may have failed."
+            )
+
+        logger.info(
+            "Resolved UUID %s -> Smartlead ID %s",
+            uuid_str, delivery.provider_campaign_id,
+        )
+        return delivery.provider_campaign_id
 
     def invalidate(self, campaign_id: int | str):
         """Remove a campaign from cache (e.g., if we suspect stale data)."""
@@ -185,37 +269,49 @@ def validate_row_json(raw_text: str) -> tuple[SheetLeadJSON | None, str | None]:
 async def validate_against_campaign(
     lead: SheetLeadJSON,
     campaign_cache: _CampaignCache,
-) -> str | None:
+) -> tuple[_CampaignInfo | None, str | None]:
     """
     Validate that the lead's email count matches the campaign's sequence count.
+    Also resolves the Smartlead campaign ID if a UUID was given.
 
     Returns:
-        None if valid
-        Error string if there's a mismatch or the campaign is invalid
+        (_CampaignInfo, None) if valid — use campaign_info.smartlead_id for push
+        (None, error_string) if there's an error
     """
-    result = await campaign_cache.get_sequence_count(lead.campaign_id)
+    result = await campaign_cache.resolve(lead.campaign_id)
 
     # If result is a string, it's an error message
     if isinstance(result, str):
-        return result
+        return None, result
 
-    # result is an int — the expected sequence count
-    expected_count = result
+    # result is _CampaignInfo
+    campaign_info = result
     actual_count = len(lead.emails)
 
-    if actual_count != expected_count:
-        return (
-            f"Email count mismatch: campaign {lead.campaign_id} has "
-            f"{expected_count} sequence(s), but you provided {actual_count} email(s). "
-            f"Provide exactly {expected_count} email(s) with step_numbers 1 through {expected_count}."
+    if actual_count != campaign_info.sequence_count:
+        error = (
+            f"Email count mismatch: campaign {lead.campaign_id} "
+            f"(Smartlead ID: {campaign_info.smartlead_id}) has "
+            f"{campaign_info.sequence_count} sequence(s), but you provided "
+            f"{actual_count} email(s). Provide exactly "
+            f"{campaign_info.sequence_count} email(s) with step_numbers "
+            f"1 through {campaign_info.sequence_count}."
         )
+        return None, error
 
-    return None
+    return campaign_info, None
 
 
-async def push_lead_to_smartlead(lead: SheetLeadJSON) -> str:
+async def push_lead_to_smartlead(
+    lead: SheetLeadJSON,
+    smartlead_campaign_id: str | int,
+) -> str:
     """
     Push a single validated lead to Smartlead.
+
+    Args:
+        lead: Validated lead data from the sheet.
+        smartlead_campaign_id: The resolved Smartlead numeric campaign ID.
 
     Returns:
         Status string for Column B.
@@ -224,7 +320,7 @@ async def push_lead_to_smartlead(lead: SheetLeadJSON) -> str:
         Any Smartlead exception — caller is responsible for catching and
         writing the error to the sheet.
     """
-    # Build the lead payload matching add_leads_to_campaign format
+    # Build the lead payload
     custom_fields: dict[str, str] = {}
     for step_email in lead.emails:
         n = step_email.step_number
@@ -240,13 +336,13 @@ async def push_lead_to_smartlead(lead: SheetLeadJSON) -> str:
     }
 
     async with get_smartlead_client() as sl:
-        result = await sl.add_leads(
-            campaign_id=lead.campaign_id,
+        await sl.add_leads(
+            campaign_id=smartlead_campaign_id,
             lead_list=[sl_lead],
         )
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    return f"OK - pushed to campaign {lead.campaign_id} at {timestamp}"
+    return f"OK - pushed to campaign {lead.campaign_id} (Smartlead ID: {smartlead_campaign_id}) at {timestamp}"
 
 
 # ---------------------------------------------------------------------------
@@ -391,8 +487,10 @@ async def _poll_once(state: _PollerState, sheet: gspread.Worksheet):
             logger.warning("Poller %s row %d validation error: %s", state.poller_id, row_num, error)
 
         else:
-            # --- Phase 2: Campaign validation (exists? email count matches?) ---
-            campaign_error = await validate_against_campaign(lead, state.campaign_cache)
+            # --- Phase 2: Campaign validation (resolve ID, check exists, email count) ---
+            campaign_info, campaign_error = await validate_against_campaign(
+                lead, state.campaign_cache
+            )
 
             if campaign_error:
                 status_text = f"ERROR - {campaign_error}"
@@ -403,9 +501,11 @@ async def _poll_once(state: _PollerState, sheet: gspread.Worksheet):
                 )
 
             else:
-                # --- Phase 3: Push to Smartlead ---
+                # --- Phase 3: Push to Smartlead using resolved ID ---
                 try:
-                    status_text = await push_lead_to_smartlead(lead)
+                    status_text = await push_lead_to_smartlead(
+                        lead, campaign_info.smartlead_id
+                    )
                     state.rows_succeeded += 1
                     logger.info("Poller %s row %d: %s", state.poller_id, row_num, status_text)
 
@@ -413,7 +513,11 @@ async def _poll_once(state: _PollerState, sheet: gspread.Worksheet):
                     # Campaign was valid when cached but now returns 404
                     # Invalidate cache so next row re-checks
                     state.campaign_cache.invalidate(lead.campaign_id)
-                    status_text = f"ERROR - Campaign {lead.campaign_id} not found on Smartlead: {e}"
+                    status_text = (
+                        f"ERROR - Campaign {lead.campaign_id} "
+                        f"(Smartlead ID: {campaign_info.smartlead_id}) "
+                        f"not found on Smartlead: {e}"
+                    )
                     state.rows_failed += 1
                     logger.error("Poller %s row %d: %s", state.poller_id, row_num, status_text)
 
@@ -476,7 +580,7 @@ class PollerManager:
                     f"Stop it first before starting a new one."
                 )
 
-        poller_id = str(uuid.uuid4())[:8]  # short ID for convenience
+        poller_id = str(uuid_module.uuid4())[:8]  # short ID for convenience
         state = _PollerState(
             poller_id=poller_id,
             spreadsheet_id=spreadsheet_id,
