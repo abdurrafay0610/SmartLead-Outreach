@@ -120,11 +120,11 @@ class _CampaignCache:
 
         if _is_uuid(campaign_id_str):
             # It's an internal UUID — look up the Smartlead ID from our DB
-            resolved = await self._resolve_uuid_to_smartlead_id(campaign_id_str)
-            if isinstance(resolved, str):
+            smartlead_id_or_error, is_error = await self._resolve_uuid_to_smartlead_id(campaign_id_str)
+            if is_error:
                 # It's an error message — DO NOT cache, retry next cycle
-                return resolved
-            smartlead_id = resolved
+                return smartlead_id_or_error
+            smartlead_id = smartlead_id_or_error
         else:
             # Assume it's already a Smartlead numeric ID
             smartlead_id = campaign_id
@@ -140,8 +140,43 @@ class _CampaignCache:
         except Exception as e:
             return f"Unexpected error fetching campaign {campaign_id}: {e}"
 
-        # Extract sequence count
-        sequences = campaign_data.get("sequences") or []
+        # Log the full response so we can debug what Smartlead returns
+        logger.info(
+            "Smartlead GET /campaigns/%s response keys: %s",
+            smartlead_id,
+            list(campaign_data.keys()) if isinstance(campaign_data, dict) else type(campaign_data).__name__,
+        )
+        logger.info(
+            "Smartlead GET /campaigns/%s full response: %s",
+            smartlead_id,
+            json.dumps(campaign_data, default=str)[:2000],  # Truncate to 2000 chars
+        )
+
+        # Extract sequence count — try multiple possible response shapes
+        sequences = None
+        if isinstance(campaign_data, dict):
+            # Try common keys where Smartlead might put sequences
+            for key_name in ("sequences", "sequence_list", "email_sequences", "steps"):
+                if key_name in campaign_data and campaign_data[key_name]:
+                    sequences = campaign_data[key_name]
+                    logger.info(
+                        "Found sequences under key '%s': type=%s, count=%s",
+                        key_name,
+                        type(sequences).__name__,
+                        len(sequences) if isinstance(sequences, list) else "N/A",
+                    )
+                    break
+
+            if sequences is None:
+                # Log all keys and their types to help identify where sequences live
+                logger.warning(
+                    "No sequences found in campaign %s response. "
+                    "Available keys and types: %s",
+                    smartlead_id,
+                    {k: f"{type(v).__name__}({len(v) if isinstance(v, (list, dict)) else v})"
+                     for k, v in campaign_data.items()},
+                )
+
         count = len(sequences) if isinstance(sequences, list) else 0
 
         if count == 0:
@@ -159,18 +194,18 @@ class _CampaignCache:
         )
         return info
 
-    async def _resolve_uuid_to_smartlead_id(self, uuid_str: str) -> int | str:
+    async def _resolve_uuid_to_smartlead_id(self, uuid_str: str) -> tuple[str, bool]:
         """
         Look up the Smartlead provider_campaign_id for an internal UUID.
 
         Returns:
-            int/str: Smartlead campaign ID on success
-            str: error message on failure
+            (smartlead_id, False) on success
+            (error_message, True) on failure
         """
         try:
             parsed_uuid = uuid_module.UUID(uuid_str)
         except ValueError:
-            return f"'{uuid_str}' looks like a UUID but is not valid"
+            return f"'{uuid_str}' looks like a UUID but is not valid", True
 
         try:
             async with async_session_factory() as session:
@@ -181,25 +216,25 @@ class _CampaignCache:
                 )
                 delivery = result.scalar_one_or_none()
         except Exception as e:
-            return f"Database error looking up campaign {uuid_str}: {e}"
+            return f"Database error looking up campaign {uuid_str}: {e}", True
 
         if not delivery:
             return (
                 f"Campaign {uuid_str} not found in our database. "
                 f"Make sure you've created this campaign via the API first."
-            )
+            ), True
 
         if not delivery.provider_campaign_id:
             return (
                 f"Campaign {uuid_str} exists in our database but has no "
                 f"Smartlead mapping. The Smartlead campaign creation may have failed."
-            )
+            ), True
 
         logger.info(
             "Resolved UUID %s -> Smartlead ID %s",
             uuid_str, delivery.provider_campaign_id,
         )
-        return delivery.provider_campaign_id
+        return delivery.provider_campaign_id, False
 
     def invalidate(self, campaign_id: int | str):
         """Remove a campaign from cache (e.g., if we suspect stale data)."""
@@ -328,11 +363,22 @@ async def push_lead_to_smartlead(
         "custom_fields": custom_fields,
     }
 
+    logger.info(
+        "Pushing lead %s to Smartlead campaign %s with %d custom_fields",
+        lead.email, smartlead_campaign_id, len(custom_fields),
+    )
+
     async with get_smartlead_client() as sl:
-        await sl.add_leads(
+        result = await sl.add_leads(
             campaign_id=smartlead_campaign_id,
             lead_list=[sl_lead],
         )
+
+    logger.info(
+        "Smartlead add_leads response for campaign %s: %s",
+        smartlead_campaign_id,
+        json.dumps(result, default=str)[:1000],
+    )
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     return f"OK - pushed to campaign {lead.campaign_id} (Smartlead ID: {smartlead_campaign_id}) at {timestamp}"
