@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 
 
 # ---------------------------------------------------------------------------
@@ -28,7 +28,7 @@ class SheetLeadJSON(BaseModel):
     (validated at runtime against Smartlead, not hardcoded here).
     """
     campaign_id: int | str = Field(..., description="Smartlead campaign ID")
-    email: str = Field(..., description="Lead email address")
+    email: EmailStr = Field(..., description="Lead email address")  # was: str
     emails: list[SheetStepEmail] = Field(
         ...,
         min_length=1,

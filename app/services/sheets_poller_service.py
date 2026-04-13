@@ -250,9 +250,10 @@ def validate_row_json(raw_text: str) -> tuple[SheetLeadJSON | None, str | None]:
             error_parts.append(f"{loc}: {err['msg']}")
         return None, "; ".join(error_parts)
 
-    # Step 3: check email format (basic)
-    if "@" not in model.email:
-        return None, "'email' must be a valid email address"
+    # Below check no longer needed, Instead we have specified that the email should be EmailStr, in the schema
+    # Step 3: check email format (basic),
+    # if "@" not in model.email:
+    #     return None, "'email' must be a valid email address"
 
     # Step 4: check step_numbers are sequential 1..N with no gaps
     step_numbers = sorted(e.step_number for e in model.emails)
