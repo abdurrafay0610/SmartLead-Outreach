@@ -136,8 +136,25 @@ class SmartleadClient:
 
         for attempt in range(1, self.max_retries + 1):
             try:
+
+                # 1. Log: Request about to be sent
+                logger.info(
+                    "➡️  SMARTLEAD REQUEST: %s %s%s | Payload: %s",
+                    method, self.base_url, url,
+                    json_body if json_body else "(none)",
+                )
+
+                # 2. The actual request sending
                 resp = await self.client.request(
                     method, url, params=params, json=json_body
+                )
+
+                # 3. Log: Response received (add right after the resp line, before any status checks)
+                logger.info(
+                    "⬅️  SMARTLEAD RESPONSE: %s %s%s | Status: %d | Body: %s",
+                    method, self.base_url, url,
+                    resp.status_code,
+                    resp.text,
                 )
 
                 # --- Rate limit: retry with backoff ---
