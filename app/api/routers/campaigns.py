@@ -276,24 +276,42 @@ async def setup_sequences(
     Each step uses numbered placeholders: {{email_subject_1}}, {{email_body_1}}, etc.
     These get filled from each lead's custom_fields when Smartlead sends.
 
+    If sequences already exist for this campaign, they will be **edited in place**
+    (not duplicated). New sequences are created only for steps that don't exist yet.
+
+    All email bodies automatically include `%signature%` after the body content.
+
     **Delay configuration (optional):**
     You can specify delays between steps. If omitted, defaults are used:
     - Step 1: 0 days (send immediately)
     - Step 2: 3 days
     - Step 3+: 5 days
 
-    Example request body for a 3-email campaign with custom delays:
-    ```json
+    **Follow-up vs standalone emails (optional):**
+    Use `steps_with_subject` to control which steps get their own subject line.
+    Steps NOT listed will have a blank subject, making them **follow-ups**
+    (replies in the same email thread as the previous standalone email).
+
+    - Step 1 **always** gets a subject regardless.
+    - If `steps_with_subject` is omitted, **all steps** get a subject (all standalone).
+
+    **Example: 4-email campaign where email 2 is a follow-up:**
+```json
     {
       "step_delays": [
         {"step_number": 1, "delay_in_days": 0},
         {"step_number": 2, "delay_in_days": 3},
-        {"step_number": 3, "delay_in_days": 7}
-      ]
+        {"step_number": 3, "delay_in_days": 5},
+        {"step_number": 4, "delay_in_days": 7}
+      ],
+      "steps_with_subject": [1, 3, 4]
     }
-    ```
-
-    Or call with no body to use default delays.
+```
+    This produces:
+    - Step 1: subject = `{{email_subject_1}}` (standalone)
+    - Step 2: subject = `""` (follow-up to step 1's thread)
+    - Step 3: subject = `{{email_subject_3}}` (new standalone thread)
+    - Step 4: subject = `{{email_subject_4}}` (new standalone thread)
     """
     service = CampaignService(db)
     try:
