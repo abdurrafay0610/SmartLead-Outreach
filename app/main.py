@@ -8,7 +8,15 @@ from app.db.redis import redis_client
 from app.db.session import engine
 from app.services.sheets_poller_service import get_poller_manager
 
+import logging
+
 settings = get_settings()
+
+# Configure logging — this is what actually makes LOG_LEVEL work
+logging.basicConfig(
+    level=settings.LOG_LEVEL.upper(),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 
 
 @asynccontextmanager
