@@ -11,9 +11,19 @@ from pydantic import BaseModel, Field, EmailStr
 # ---------------------------------------------------------------------------
 
 class SheetStepEmail(BaseModel):
-    """One email step as pasted in the sheet JSON."""
+    """One email step as pasted in the sheet JSON.
+
+    Subject is optional — follow-up steps (blank subject in Smartlead
+    sequence template) don't need one.  Validation against the actual
+    sequence template happens in validate_subject_against_sequences().
+    """
     step_number: int = Field(..., ge=1, le=10)
-    subject: str = Field(..., min_length=1)
+    subject: Optional[str] = Field(
+        None,
+        description="Email subject. Required for steps that have a subject "
+                    "placeholder in the sequence template. Omit or set to null "
+                    "for follow-up steps (blank subject in template).",
+    )
     body: str = Field(..., min_length=1, description="HTML email body")
 
 

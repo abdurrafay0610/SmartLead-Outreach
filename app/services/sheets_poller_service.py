@@ -27,7 +27,7 @@ import json
 import logging
 import re
 import uuid as uuid_module
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -83,9 +83,52 @@ def _get_gspread_client() -> gspread.Client:
 
 @dataclass
 class _CampaignInfo:
-    """Resolved campaign info — cached after first lookup."""
     smartlead_id: str | int  # The actual Smartlead numeric campaign ID
     sequence_count: int
+    follow_up_steps: set[int] = field(default_factory=set)  # Steps with blank subject in template
+
+class _SequenceCache:
+    """
+    Caches follow-up step info fetched from Smartlead's GET /campaigns/{id}/sequences.
+
+    Refreshed at the start of each poll cycle (clear → re-populate on first access).
+    Within a single cycle, the same campaign's sequence data is reused.
+    """
+
+    def __init__(self):
+        self._cache: dict[str, set[int]] = {}  # smartlead_campaign_id -> follow_up_steps
+
+    async def get_follow_up_steps(self, smartlead_campaign_id: str | int) -> set[int]:
+        """
+        Fetch sequence templates from Smartlead and determine which steps
+        are follow-ups (blank subject = no placeholder).
+
+        Returns a set of step numbers that are follow-ups.
+        """
+        key = str(smartlead_campaign_id)
+        if key in self._cache:
+            return self._cache[key]
+
+        async with get_smartlead_client() as sl:
+            sequences = await sl.get_sequences(smartlead_campaign_id)
+
+        follow_up_steps: set[int] = set()
+        for seq in sequences:
+            seq_num = seq.get("seq_number")
+            subject = seq.get("subject", "")
+            if seq_num is not None and (not subject or subject.strip() == ""):
+                follow_up_steps.add(seq_num)
+
+        self._cache[key] = follow_up_steps
+        logger.info(
+            "Cached sequence info for Smartlead campaign %s: follow_up_steps=%s",
+            smartlead_campaign_id, follow_up_steps,
+        )
+        return follow_up_steps
+
+    def clear(self):
+        """Clear cache — call at the start of each poll cycle."""
+        self._cache.clear()
 
 
 class _CampaignCache:
@@ -299,6 +342,44 @@ async def validate_against_campaign(
 
     return campaign_info, None
 
+async def validate_subject_against_sequences(
+    lead: SheetLeadJSON,
+    smartlead_campaign_id: str | int,
+    sequence_cache: _SequenceCache,
+) -> tuple[list[str], list[str]]:
+    """
+    Validate each email step's subject against the Smartlead sequence template.
+
+    Returns:
+        (errors, warnings) — both are lists of human-readable strings.
+        - errors: steps that REQUIRE a subject but didn't get one → row is rejected
+        - warnings: steps that are follow-ups but got a subject anyway → lead pushed, subject ignored
+    """
+    follow_up_steps = await sequence_cache.get_follow_up_steps(smartlead_campaign_id)
+
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    for step_email in lead.emails:
+        step = step_email.step_number
+        has_subject = step_email.subject is not None and step_email.subject.strip() != ""
+        is_follow_up = step in follow_up_steps
+
+        if is_follow_up and has_subject:
+            # Follow-up step but subject was provided — warn, don't block
+            warnings.append(
+                f"Step {step} is a follow-up (no subject in sequence template), "
+                f"but you provided subject \"{step_email.subject}\". "
+                f"It will be ignored by Smartlead."
+            )
+        elif not is_follow_up and not has_subject:
+            # Step requires a subject but none was provided — error
+            errors.append(
+                f"Step {step} requires a subject (sequence template has a subject "
+                f"placeholder), but no subject was provided in the JSON."
+            )
+
+    return errors, warnings
 
 async def push_lead_to_smartlead(
     lead: SheetLeadJSON,
@@ -322,7 +403,10 @@ async def push_lead_to_smartlead(
     custom_fields: dict[str, str] = {}
     for step_email in lead.emails:
         n = step_email.step_number
-        custom_fields[f"email_subject_{n}"] = step_email.subject
+        # Only include subject in custom_fields if it was actually provided
+        # (follow-up steps won't have one, and Smartlead doesn't need it)
+        if step_email.subject is not None and step_email.subject.strip() != "":
+            custom_fields[f"email_subject_{n}"] = step_email.subject
         custom_fields[f"email_body_{n}"] = step_email.body
 
     sl_lead = {
@@ -384,6 +468,7 @@ class _PollerState:
         # Per-poller campaign cache — avoids re-fetching campaign info
         # for every single row with the same campaign_id
         self.campaign_cache = _CampaignCache()
+        self.sequence_cache = _SequenceCache()
 
     def request_stop(self):
         self._stop_event.set()
@@ -469,6 +554,9 @@ async def _poll_loop(state: _PollerState):
 
 async def _poll_once(state: _PollerState, sheet: gspread.Worksheet):
     """Process all unhandled rows in one poll cycle."""
+    # Refresh sequence cache each cycle — ensures follow-up step info is fresh
+    state.sequence_cache.clear()
+
     # Run the blocking gspread call in a thread to avoid blocking the event loop
     all_values = await asyncio.to_thread(sheet.get_all_values)
 
@@ -509,36 +597,56 @@ async def _poll_once(state: _PollerState, sheet: gspread.Worksheet):
                     state.poller_id, row_num, campaign_error,
                 )
 
+
             else:
-                # --- Phase 3: Push to Smartlead using resolved ID ---
-                try:
-                    status_text = await push_lead_to_smartlead(
-                        lead, campaign_info.smartlead_id
+                # --- Phase 2.5: Validate subjects against sequence templates ---
+                subject_errors, subject_warnings = await validate_subject_against_sequences(
+                    lead, campaign_info.smartlead_id, state.sequence_cache,
+                )
+
+                if subject_errors:
+                    status_text = f"ERROR - {'; '.join(subject_errors)}"
+                    state.rows_failed += 1
+                    logger.warning(
+                        "Poller %s row %d subject validation error: %s",
+                        state.poller_id, row_num, status_text,
                     )
-                    state.rows_succeeded += 1
-                    logger.info("Poller %s row %d: %s", state.poller_id, row_num, status_text)
 
-                except SmartleadNotFoundError as e:
-                    # Campaign was valid when cached but now returns 404
-                    # Invalidate cache so next row re-checks
-                    state.campaign_cache.invalidate(lead.campaign_id)
-                    status_text = (
-                        f"ERROR - Campaign {lead.campaign_id} "
-                        f"(Smartlead ID: {campaign_info.smartlead_id}) "
-                        f"not found on Smartlead: {e}"
-                    )
-                    state.rows_failed += 1
-                    logger.error("Poller %s row %d: %s", state.poller_id, row_num, status_text)
+                else:
+                    # --- Phase 3: Push to Smartlead using resolved ID ---
+                    try:
+                        status_text = await push_lead_to_smartlead(
+                            lead, campaign_info.smartlead_id
+                        )
+                        state.rows_succeeded += 1
 
-                except SmartleadAPIError as e:
-                    status_text = f"ERROR - Smartlead API error: {e}"
-                    state.rows_failed += 1
-                    logger.error("Poller %s row %d Smartlead error: %s", state.poller_id, row_num, e)
+                        # Append warnings to the OK status if any
+                        if subject_warnings:
+                            warning_text = " | WARNINGS: " + "; ".join(subject_warnings)
+                            status_text += warning_text
+                        logger.info("Poller %s row %d: %s", state.poller_id, row_num, status_text)
 
-                except Exception as e:
-                    status_text = f"ERROR - Unexpected: {e}"
-                    state.rows_failed += 1
-                    logger.error("Poller %s row %d unexpected error: %s", state.poller_id, row_num, e)
+                    except SmartleadNotFoundError as e:
+                        # Campaign was valid when cached but now returns 404
+                        # Invalidate cache so next row re-checks
+                        state.campaign_cache.invalidate(lead.campaign_id)
+                        status_text = (
+                            f"ERROR - Campaign {lead.campaign_id} "
+                            f"(Smartlead ID: {campaign_info.smartlead_id}) "
+                            f"not found on Smartlead: {e}"
+                        )
+                        state.rows_failed += 1
+                        logger.error("Poller %s row %d: %s", state.poller_id, row_num, status_text)
+
+                    except SmartleadAPIError as e:
+                        status_text = f"ERROR - Smartlead API error: {e}"
+                        state.rows_failed += 1
+                        logger.error("Poller %s row %d Smartlead error: %s", state.poller_id, row_num, e)
+
+                    except Exception as e:
+                        status_text = f"ERROR - Unexpected: {e}"
+                        state.rows_failed += 1
+                        logger.error("Poller %s row %d unexpected error: %s", state.poller_id, row_num, e)
 
         state.rows_processed += 1
 
