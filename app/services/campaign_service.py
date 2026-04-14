@@ -538,18 +538,6 @@ class CampaignService:
                 existing_id_map,
             )
 
-        async with get_smartlead_client() as sl:
-            result = await sl.update_sequences(
-                campaign_id=delivery.provider_campaign_id,
-                sequences=sequences,
-            )
-            logger.info(
-                "Sequences set for campaign %s: %d steps, delays=%s",
-                campaign_id,
-                num_steps,
-                {s: delay_lookup[s] for s in range(1, num_steps + 1)},
-            )
-
         return {
             "num_steps": num_steps,
             "step_delays": {str(s): delay_lookup[s] for s in range(1, num_steps + 1)},
