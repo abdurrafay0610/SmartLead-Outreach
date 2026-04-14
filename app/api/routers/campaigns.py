@@ -298,9 +298,11 @@ async def setup_sequences(
     service = CampaignService(db)
     try:
         step_delays = request.step_delays if request else None
+        # In the setup_sequences router handler:
         result = await service.setup_sequences(
             campaign_id=campaign_id,
-            step_delays=step_delays,
+            step_delays=request.step_delays if request else None,
+            steps_with_subject=set(request.steps_with_subject) if request and request.steps_with_subject else None,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

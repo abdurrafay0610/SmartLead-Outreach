@@ -304,6 +304,22 @@ class SmartleadClient:
     # Sequence endpoints
     # ------------------------------------------------------------------
 
+    async def get_sequences(
+            self,
+            campaign_id: str | int,
+    ) -> list[dict[str, Any]]:
+        """
+        GET /campaigns/{id}/sequences
+        Returns existing sequence steps for a campaign.
+        Each item has 'id', 'seq_number', 'subject', 'email_body', etc.
+        Returns empty list if no sequences exist.
+        """
+        result = await self._request("GET", f"/campaigns/{campaign_id}/sequences")
+        # Response might be a list directly or wrapped
+        if isinstance(result, list):
+            return result
+        return result.get("sequences", result.get("data", []))
+
     async def update_sequences(
         self,
         campaign_id: str | int,

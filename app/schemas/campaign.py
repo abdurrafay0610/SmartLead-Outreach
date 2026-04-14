@@ -60,6 +60,16 @@ class SequenceSetupRequest(BaseModel):
                     "If omitted, default delays are used (step 1=0, step 2=3, step 3+=5 days).",
     )
 
+    steps_with_subject: Optional[list[int]] = Field(
+        None,
+        description="Which step numbers should have their own subject line. "
+                    "Steps NOT listed here will have a blank subject, making them "
+                    "follow-ups (replies in the same thread). "
+                    "If omitted, ALL steps get a subject. "
+                    "Step 1 always gets a subject regardless.",
+        examples=[[1], [1, 3]],
+    )
+
 
 class ScheduleConfig(BaseModel):
     timezone: str = Field(..., examples=["America/New_York"])

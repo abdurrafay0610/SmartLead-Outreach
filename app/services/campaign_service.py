@@ -425,9 +425,10 @@ class CampaignService:
     # ------------------------------------------------------------------
 
     async def setup_sequences(
-        self,
-        campaign_id: uuid.UUID,
-        step_delays: list[SequenceStepDelay] | None = None,
+            self,
+            campaign_id: uuid.UUID,
+            step_delays: list[SequenceStepDelay] | None = None,
+            steps_with_subject: set[int] | None = None,  # NEW — which steps get a subject
     ) -> dict[str, Any]:
         """
         Creates N sequence steps on Smartlead, one per num_emails_per_lead.
@@ -440,9 +441,10 @@ class CampaignService:
         These get filled from each lead's custom_fields when Smartlead sends.
 
         Args:
-            campaign_id: Internal campaign UUID
-            step_delays: Optional per-step delay config. If not provided,
+            :param campaign_id: Internal campaign UUID
+            :param step_delays: Optional per-step delay config. If not provided,
                         defaults are used (step 1=0, step 2=3, step N=5+ days).
+            :param steps_with_subject:
         """
         campaign = await self._get_campaign(campaign_id)
         delivery = await self._get_delivery(campaign_id)
@@ -471,18 +473,69 @@ class CampaignService:
         delay_lookup[1] = 0
 
         # Build sequence list for Smartlead
+        # NEW — edit if exists, add signature, support blank subject for follow-ups
+
+        # Fetch existing sequences to decide create vs edit
+        async with get_smartlead_client() as sl:
+            existing_sequences = await sl.get_sequences(delivery.provider_campaign_id)
+
+        # Build a lookup: seq_number -> existing smartlead sequence id
+        existing_id_map: dict[int, int] = {}
+        for seq in existing_sequences:
+            seq_num = seq.get("seq_number")
+            seq_id = seq.get("id")
+            if seq_num is not None and seq_id is not None:
+                existing_id_map[seq_num] = seq_id
+
+        # Determine which steps should have a blank subject (follow-ups)
+        # follow_up_steps is a set of step numbers that should NOT have a subject
+        # Step 1 always gets a subject. Steps 2+ default to follow-up unless
+        # explicitly included in `steps_with_subject`.
+        follow_up_steps: set[int] = set()
+        if steps_with_subject is not None:
+            for step in range(1, num_steps + 1):
+                if step not in steps_with_subject:
+                    follow_up_steps.add(step)
+
+        # Build sequence list for Smartlead
         sequences = []
         for step in range(1, num_steps + 1):
+            # Use existing ID if sequence already exists, else None for new
+            seq_id = existing_id_map.get(step)
+
+            # Subject: blank for follow-up steps, placeholder for others
+            if step in follow_up_steps:
+                subject = ""
+            else:
+                subject = "{{" + f"email_subject_{step}" + "}}"
+
+            # Body: always append %signature% on the next line
+            email_body = "{{" + f"email_body_{step}" + "}}\n%signature%"
+
             sequences.append(
                 {
-                    "id": None,
+                    "id": seq_id,  # None = create new, int = edit existing
                     "seq_number": step,
-                    "subject": "{{" + f"email_subject_{step}" + "}}",
-                    "email_body": "{{" + f"email_body_{step}" + "}}",
+                    "subject": subject,
+                    "email_body": email_body,
                     "seq_delay_details": {
                         "delay_in_days": delay_lookup[step],
                     },
                 }
+            )
+
+        async with get_smartlead_client() as sl:
+            result = await sl.update_sequences(
+                campaign_id=delivery.provider_campaign_id,
+                sequences=sequences,
+            )
+            logger.info(
+                "Sequences set for campaign %s: %d steps, delays=%s, follow_ups=%s, edited_ids=%s",
+                campaign_id,
+                num_steps,
+                {s: delay_lookup[s] for s in range(1, num_steps + 1)},
+                follow_up_steps,
+                existing_id_map,
             )
 
         async with get_smartlead_client() as sl:
